@@ -50,10 +50,12 @@ app.get('/api/auth/google/callback', async (req, res) => {
     fetchRecentEmails();
     
     // Redirect back to the frontend Channels page
-    res.redirect('http://localhost:3001/channels?connected=gmail');
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    res.redirect(`${frontendUrl}/channels?connected=gmail`);
   } catch (error) {
     console.error("Google Auth Error:", error);
-    res.redirect('http://localhost:3001/channels?error=auth_failed');
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    res.redirect(`${frontendUrl}/channels?error=auth_failed`);
   }
 });
 
