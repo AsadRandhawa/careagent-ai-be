@@ -115,13 +115,15 @@ app.post('/api/user/knowledge-base', authenticateToken, async (req, res) => {
 
 // 1. Google Auth Login
 app.get('/api/auth/google', (req, res) => {
+  const token = req.query.token;
   const url = oauth2Client.generateAuthUrl({
     access_type: 'offline', // Request a refresh token
     prompt: 'consent',
     scope: [
       'https://www.googleapis.com/auth/gmail.modify', 
       'https://www.googleapis.com/auth/userinfo.email'
-    ]
+    ],
+    state: token || ''
   });
   res.redirect(url);
 });
@@ -195,9 +197,22 @@ app.post('/api/draft', async (req, res) => {
 });
 
 // Endpoint to fetch LIVE emails for the Inbox
-app.get('/api/emails', async (req, res) => {
+app.get('/api/emails', authenticateToken, async (req, res) => {
   try {
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
+    
+    if (!user || !user.googleTokens) {
+      return res.status(400).json({ error: "Gmail not connected for this user." });
+    }
+
+    const userOAuthClient = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      process.env.GOOGLE_REDIRECT_URI || "http://localhost:5000/api/auth/google/callback"
+    );
+    userOAuthClient.setCredentials(user.googleTokens);
+
+    const gmail = google.gmail({ version: 'v1', auth: userOAuthClient });
     const response = await gmail.users.messages.list({
       userId: 'me',
       maxResults: 10,
