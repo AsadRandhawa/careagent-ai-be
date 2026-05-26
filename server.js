@@ -3,6 +3,9 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
+import { PrismaClient } from '@prisma/client';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 
 dotenv.config();
 
@@ -10,9 +13,23 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const prisma = new PrismaClient();
+
 const openai = new OpenAI({
   apiKey: process.env.VITE_OPENAI_API_KEY || process.env.OPENAI_API_KEY
 });
+
+// Middleware to authenticate JWT
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (token == null) return res.sendStatus(401);
+  jwt.verify(token, process.env.JWT_SECRET || 'secret_key', (err, user) => {
+    if (err) return res.sendStatus(403);
+    req.user = user;
+    next();
+  });
+};
 
 // Google OAuth Setup
 const oauth2Client = new google.auth.OAuth2(
@@ -22,6 +39,79 @@ const oauth2Client = new google.auth.OAuth2(
 );
 
 // --- ROUTES ---
+
+// 0. Custom Auth
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const existingUser = await prisma.user.findUnique({ where: { email } });
+    if (existingUser) return res.status(400).json({ error: 'User already exists' });
+    
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const user = await prisma.user.create({
+      data: { email, password: hashedPassword, documents: [] }
+    });
+    
+    const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET || 'secret_key');
+    res.json({ token });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to register' });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) return res.status(400).json({ error: 'Invalid credentials' });
+    
+    const validPassword = await bcrypt.compare(password, user.password);
+    if (!validPassword) return res.status(400).json({ error: 'Invalid credentials' });
+    
+    const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET || 'secret_key');
+    res.json({ token });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to login' });
+  }
+});
+
+app.get('/api/user/me', authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.userId },
+      select: { id: true, email: true, documents: true, businessIdentity: true, brandVoice: true }
+    });
+    // Format the response to match the previous MongoDB shape for the frontend
+    res.json({
+      id: user.id,
+      email: user.email,
+      knowledgeBase: {
+        documents: user.documents,
+        businessIdentity: user.businessIdentity,
+        brandVoice: user.brandVoice
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch user' });
+  }
+});
+
+app.post('/api/user/knowledge-base', authenticateToken, async (req, res) => {
+  try {
+    const { documents, businessIdentity, brandVoice } = req.body;
+    await prisma.user.update({
+      where: { id: req.user.userId },
+      data: {
+        documents: documents || [],
+        businessIdentity,
+        brandVoice
+      }
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update knowledge base' });
+  }
+});
 
 // 1. Google Auth Login
 app.get('/api/auth/google', (req, res) => {
@@ -38,12 +128,24 @@ app.get('/api/auth/google', (req, res) => {
 
 // 2. Google Auth Callback
 app.get('/api/auth/google/callback', async (req, res) => {
-  const { code } = req.query;
+  const { code, state } = req.query; // state could contain user token
   try {
     const { tokens } = await oauth2Client.getToken(code);
     oauth2Client.setCredentials(tokens);
     
     // In a real app, save these tokens to your database!
+    if (state) {
+      try {
+        const decoded = jwt.verify(state, process.env.JWT_SECRET || 'secret_key');
+        await prisma.user.update({
+          where: { id: decoded.userId },
+          data: { googleTokens: tokens }
+        });
+      } catch (err) {
+        console.error("Failed to link Google account to user:", err);
+      }
+    }
+
     console.log("Successfully acquired Google Tokens!");
     
     // Immediately test fetching emails
