@@ -1,20 +1,21 @@
 {
   "name": "careagent-backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
+    "start":       "node server.js",
+    "dev":         "node --watch server.js",
     "postinstall": "prisma generate"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",
-    "bcryptjs": "^3.0.3",
-    "cors": "^2.8.5",
-    "dotenv": "^17.2.3",
-    "express": "^4.21.2",
-    "googleapis": "^172.0.0",
-    "jsonwebtoken": "^9.0.3",
-    "openai": "^6.39.0"
+    "bcryptjs":       "^3.0.3",
+    "cors":           "^2.8.5",
+    "dotenv":         "^17.2.3",
+    "express":        "^4.21.2",
+    "googleapis":     "^172.0.0",
+    "jsonwebtoken":   "^9.0.3",
+    "openai":         "^6.39.0"
   },
   "devDependencies": {
     "prisma": "^5.22.0"
