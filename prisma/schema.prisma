@@ -21,6 +21,44 @@ model User {
   whatsappToken         String?
   whatsappPhoneNumberId String?
   whatsappWabaId        String?
+  tickets               Ticket[]
   createdAt             DateTime @default(now())
   updatedAt             DateTime @updatedAt
+}
+
+model Ticket {
+  id           String    @id @default(uuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // External IDs
+  externalId   String    // Gmail message ID or WhatsApp message ID
+  threadId     String?   // Gmail thread ID
+
+  // Customer info
+  customerName String
+  customerEmail String?
+  phoneNumber  String?
+
+  // Content
+  subject      String?
+  content      String
+  channel      String    @default("gmail") // gmail | whatsapp
+
+  // Status & classification
+  status       String    @default("new")   // new | pending | resolved | escalated
+  sentiment    String    @default("Neutral") // Positive | Neutral | Negative | Urgent
+  category     String    @default("General")
+  urgency      Int       @default(1)       // 1-5
+
+  // Timestamps
+  receivedAt   DateTime  @default(now())
+  resolvedAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@unique([userId, externalId])           // prevent duplicate syncs
+  @@index([userId, status])
+  @@index([userId, receivedAt])
+  @@index([userId, channel])
 }
