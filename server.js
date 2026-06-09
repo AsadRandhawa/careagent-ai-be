@@ -95,16 +95,20 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
         id: true, email: true, documents: true,
         businessIdentity: true, brandVoice: true,
         googleTokens: true, gmailEnabled: true,
+        aiAutoDrafting: true, autoClassification: true, sentimentTracking: true,
         lastSeenInboxAt: true, lastSeenEscalAt: true,
       }
     });
     res.json({
       id: user.id,
       email: user.email,
-      googleConnected: !!user.googleTokens,
-      gmailEnabled: user.gmailEnabled ?? true,
-      lastSeenInboxAt: user.lastSeenInboxAt,
-      lastSeenEscalAt: user.lastSeenEscalAt,
+      googleConnected:    !!user.googleTokens,
+      gmailEnabled:       user.gmailEnabled       ?? true,
+      aiAutoDrafting:     user.aiAutoDrafting     ?? true,
+      autoClassification: user.autoClassification ?? true,
+      sentimentTracking:  user.sentimentTracking  ?? false,
+      lastSeenInboxAt:    user.lastSeenInboxAt,
+      lastSeenEscalAt:    user.lastSeenEscalAt,
       knowledgeBase: {
         documents: user.documents,
         businessIdentity: user.businessIdentity,
@@ -132,11 +136,15 @@ app.post('/api/user/knowledge-base', authenticateToken, async (req, res) => {
 // Update user preferences (gmailEnabled, lastSeenInboxAt, lastSeenEscalAt)
 app.patch('/api/user/preferences', authenticateToken, async (req, res) => {
   try {
-    const { gmailEnabled, lastSeenInboxAt, lastSeenEscalAt } = req.body;
+    const { gmailEnabled, lastSeenInboxAt, lastSeenEscalAt,
+            aiAutoDrafting, autoClassification, sentimentTracking } = req.body;
     const data = {};
-    if (gmailEnabled !== undefined) data.gmailEnabled = gmailEnabled;
-    if (lastSeenInboxAt !== undefined) data.lastSeenInboxAt = new Date(lastSeenInboxAt);
-    if (lastSeenEscalAt !== undefined) data.lastSeenEscalAt = new Date(lastSeenEscalAt);
+    if (gmailEnabled          !== undefined) data.gmailEnabled          = gmailEnabled;
+    if (aiAutoDrafting        !== undefined) data.aiAutoDrafting        = aiAutoDrafting;
+    if (autoClassification    !== undefined) data.autoClassification    = autoClassification;
+    if (sentimentTracking     !== undefined) data.sentimentTracking     = sentimentTracking;
+    if (lastSeenInboxAt       !== undefined) data.lastSeenInboxAt       = new Date(lastSeenInboxAt);
+    if (lastSeenEscalAt       !== undefined) data.lastSeenEscalAt       = new Date(lastSeenEscalAt);
     await prisma.user.update({ where: { id: req.user.userId }, data });
     res.json({ success: true });
   } catch (err) {

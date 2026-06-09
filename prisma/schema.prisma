@@ -26,6 +26,11 @@ model User {
   // Channel preferences
   gmailEnabled          Boolean   @default(true)
 
+  // Automation settings
+  aiAutoDrafting        Boolean   @default(true)
+  autoClassification    Boolean   @default(true)
+  sentimentTracking     Boolean   @default(false)
+
   // Sidebar badge tracking — badges show tickets newer than these timestamps
   lastSeenInboxAt       DateTime?
   lastSeenEscalAt       DateTime?
