@@ -436,10 +436,13 @@ app.post('/api/ai/draft', authenticateToken, async (req, res) => {
 
 app.post('/api/chat', async (req, res) => {
   try {
-    const { messages } = req.body;
+    const { messages, system } = req.body;
+    const fullMessages = system
+      ? [{ role: 'system', content: system }, ...messages]
+      : messages;
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      messages,
+      messages: fullMessages,
       temperature: 0.7,
     });
     res.json({ reply: response.choices[0]?.message?.content || '' });
