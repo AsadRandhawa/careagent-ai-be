@@ -11,10 +11,10 @@ datasource db {
 }
 
 model User {
-  id                    String   @id @default(uuid())
-  email                 String   @unique
+  id                    String    @id @default(uuid())
+  email                 String    @unique
   password              String
-  documents             Json?    @default("[]")
+  documents             Json?     @default("[]")
   businessIdentity      String?
   brandVoice            String?
   googleTokens          Json?
@@ -22,8 +22,16 @@ model User {
   whatsappPhoneNumberId String?
   whatsappWabaId        String?
   tickets               Ticket[]
-  createdAt             DateTime @default(now())
-  updatedAt             DateTime @updatedAt
+
+  // Channel preferences
+  gmailEnabled          Boolean   @default(true)
+
+  // Sidebar badge tracking — badges show tickets newer than these timestamps
+  lastSeenInboxAt       DateTime?
+  lastSeenEscalAt       DateTime?
+
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
 }
 
 model Ticket {
