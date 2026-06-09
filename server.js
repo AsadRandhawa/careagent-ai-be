@@ -99,6 +99,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
         lastSeenInboxAt: true, lastSeenEscalAt: true,
       }
     });
+    res.set('Cache-Control', 'no-store');
     res.json({
       id: user.id,
       email: user.email,
@@ -384,7 +385,7 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
     ]);
 
     const total = openTickets + resolvedThisPeriod;
-    const escalationRate = total > 0 ? ((escalated / total) * 100).toFixed(1) + '%' : '0.0%';
+    const escalationRate = (total > 0 && escalated > 0) ? ((escalated / total) * 100).toFixed(1) + '%' : '0.0%';
 
     // Build weekly volume buckets
     const weeklyMap = {};
