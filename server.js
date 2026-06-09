@@ -10,29 +10,17 @@ import jwt from 'jsonwebtoken';
 dotenv.config();
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: [
+    'https://careagent.flint-sol.com',
+    'https://careagent-ai-fe-production.up.railway.app',
+    'http://localhost:3000',
+    'http://localhost:5173',
+  ],
+  credentials: true,
+}));
 app.use(express.json());
 
-// ── Debug: test OpenAI connection ─────────────────────────
-app.get('/api/test-ai', async (req, res) => {
-  try {
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [{ role: 'user', content: 'Say OK' }],
-      max_tokens: 5,
-    });
-    res.json({ ok: true, reply: response.choices[0]?.message?.content });
-  } catch (err) {
-    res.status(500).json({ 
-      ok: false, 
-      error: err?.message, 
-      status: err?.status,
-      type: err?.type,
-      code: err?.code,
-      key_prefix: process.env.VITE_OPENAI_API_KEY?.slice(0, 10) + '...'
-    });
-  }
-});
 
 const prisma = new PrismaClient();
 
