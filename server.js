@@ -13,6 +13,27 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ── Debug: test OpenAI connection ─────────────────────────
+app.get('/api/test-ai', async (req, res) => {
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'Say OK' }],
+      max_tokens: 5,
+    });
+    res.json({ ok: true, reply: response.choices[0]?.message?.content });
+  } catch (err) {
+    res.status(500).json({ 
+      ok: false, 
+      error: err?.message, 
+      status: err?.status,
+      type: err?.type,
+      code: err?.code,
+      key_prefix: process.env.VITE_OPENAI_API_KEY?.slice(0, 10) + '...'
+    });
+  }
+});
+
 const prisma = new PrismaClient();
 
 const openai = new OpenAI({
