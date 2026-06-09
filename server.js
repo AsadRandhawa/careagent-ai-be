@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import OpenAI from 'openai';
+import { OpenAI } from 'openai';
 import { google } from 'googleapis';
 import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
@@ -447,8 +447,8 @@ app.post('/api/chat', async (req, res) => {
     });
     res.json({ reply: response.choices[0]?.message?.content || '' });
   } catch (error) {
-    console.error('Chat Error:', error);
-    res.status(500).json({ error: 'Failed to process chat' });
+    console.error('Chat Error:', error?.message || error?.status || error);
+    res.status(500).json({ error: error?.message || 'Failed to process chat' });
   }
 });
 
