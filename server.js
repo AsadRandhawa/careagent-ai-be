@@ -258,7 +258,7 @@ app.get('/api/gmail/emails', authenticateToken, async (req, res) => {
         subject,
         time:         timeString,
         createdAt,
-        status:       dbTicket?.status || 'new',
+        status:       (dbTicket?.status === 'resolved') ? 'resolved' : 'new',
         hasDraft:     true,
         avatarVariant: ['blue', 'purple', 'green', 'orange'][Math.floor(Math.random() * 4)],
         email:        emailAddress,
