@@ -403,7 +403,7 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
     ]);
 
     const openTickets = gmailOpenCount;
-    const resolvedCount = resolvedThisPeriod || 0;
+    const resolvedCount = (Number.isFinite(resolvedThisPeriod) ? resolvedThisPeriod : 0);
     const total = openTickets + resolvedCount;
     const escalationRate = (total > 0 && escalated > 0) ? ((escalated / total) * 100).toFixed(1) + '%' : '0.0%';
 
@@ -417,9 +417,9 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
     const volumeData = Object.entries(weeklyMap).map(([name, count]) => ({ name, count }));
 
     res.json({
-      openTickets,
-      resolvedThisPeriod: resolvedCount,
-      escalated,
+      openTickets:        parseInt(openTickets) || 0,
+      resolvedThisPeriod: parseInt(resolvedCount) || 0,
+      escalated:          parseInt(escalated) || 0,
       escalationRate,
       avgResolutionTime: 'N/A',
       aiDraftsReady: openTickets,
