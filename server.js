@@ -377,9 +377,18 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
     const userId = req.user.userId;
 
-    const [openTickets, resolvedThisPeriod, escalated, volumeTrend] = await Promise.all([
-      // Count open (non-resolved) tickets
-      prisma.ticket.count({ where: { userId, status: { not: 'resolved' } } }),
+    // Get live Gmail inbox count for open tickets
+    let gmailOpenCount = 0;
+    try {
+      const user = await prisma.user.findUnique({ where: { id: userId } });
+      if (user?.googleTokens && user?.gmailEnabled !== false) {
+        const gmailClient = google.gmail({ version: 'v1', auth: getUserOAuth(user.googleTokens) });
+        const gmailRes = await gmailClient.users.messages.list({ userId: 'me', maxResults: 1, q: 'in:inbox' });
+        gmailOpenCount = gmailRes.data.resultSizeEstimate || 0;
+      }
+    } catch (e) { console.error('Gmail count error:', e.message); }
+
+    const [resolvedThisPeriod, escalated, volumeTrend] = await Promise.all([
       // Count resolved in this period
       prisma.ticket.count({ where: { userId, status: 'resolved', resolvedAt: { gte: since } } }),
       // Count escalated
@@ -393,7 +402,9 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
       })
     ]);
 
-    const total = openTickets + resolvedThisPeriod;
+    const openTickets = gmailOpenCount;
+    const resolvedCount = resolvedThisPeriod || 0;
+    const total = openTickets + resolvedCount;
     const escalationRate = (total > 0 && escalated > 0) ? ((escalated / total) * 100).toFixed(1) + '%' : '0.0%';
 
     // Build weekly volume buckets
@@ -407,7 +418,7 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
 
     res.json({
       openTickets,
-      resolvedThisPeriod,
+      resolvedThisPeriod: resolvedCount,
       escalated,
       escalationRate,
       avgResolutionTime: 'N/A',
