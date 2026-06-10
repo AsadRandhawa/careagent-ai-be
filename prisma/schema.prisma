@@ -64,6 +64,8 @@ model Ticket {
   category     String    @default("General")
   urgency      Int       @default(1)       // 1-5
 
+  escalationReason String?
+
   // Timestamps
   receivedAt   DateTime  @default(now())
   resolvedAt   DateTime?

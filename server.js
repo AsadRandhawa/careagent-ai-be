@@ -423,7 +423,20 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
       escalationRate,
       avgResolutionTime: 'N/A',
       aiDraftsReady: openTickets,
-      sentimentPct: { positive: 0, neutral: 100, frustrated: 0 },
+      sentimentPct: await (async () => {
+        const total_s = await prisma.ticket.count({ where: { userId } });
+        if (total_s === 0) return { positive: 0, neutral: 100, frustrated: 0 };
+        const [pos, frust] = await Promise.all([
+          prisma.ticket.count({ where: { userId, sentiment: 'Positive' } }),
+          prisma.ticket.count({ where: { userId, sentiment: 'Frustrated' } }),
+        ]);
+        const neu = total_s - pos - frust;
+        return {
+          positive:   Math.round((pos / total_s) * 100),
+          neutral:    Math.round((neu / total_s) * 100),
+          frustrated: Math.round((frust / total_s) * 100),
+        };
+      })(),
       categoryStats: [{ name: 'General', value: 100, count: openTickets }],
       volumeTrend: volumeData,
       miniBarData: []
@@ -438,18 +451,57 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
 // AI ROUTES
 // ═══════════════════════════════════════════════════════════
 
+// Helper: keyword-based sentiment analysis
+const analyzeSentiment = (text) => {
+  const t = (text || '').toLowerCase();
+  const frustratedWords = ['angry','furious','terrible','awful','worst','horrible','refund','scam','fraud','useless','garbage','ridiculous','unacceptable','disappointed','never again','cheated','lied'];
+  const positiveWords = ['thank','great','excellent','amazing','wonderful','love','perfect','brilliant','fantastic','happy','satisfied','awesome'];
+  const frustratedScore = frustratedWords.filter(w => t.includes(w)).length;
+  const positiveScore = positiveWords.filter(w => t.includes(w)).length;
+  if (frustratedScore >= 2 || (frustratedScore >= 1 && t.includes('!'))) return 'Frustrated';
+  if (positiveScore >= 1) return 'Positive';
+  return 'Neutral';
+};
+
 app.post('/api/ai/draft', authenticateToken, async (req, res) => {
   try {
-    const { messages } = req.body;
+    const { messages, ticketId, ticketContent, ticketSubject } = req.body;
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       response_format: { type: 'json_object' },
       messages,
     });
     const draftObj = JSON.parse(response.choices[0]?.message?.content || '{}');
+
+    // Persist escalation status + sentiment to DB
+    if (ticketId) {
+      const sentiment = analyzeSentiment((ticketContent || '') + ' ' + (ticketSubject || ''));
+      const updateData = { sentiment };
+      if (draftObj.status === 'escalated') {
+        updateData.status = 'escalated';
+        updateData.escalationReason = draftObj.reason || 'AI escalated';
+      }
+      prisma.ticket.upsert({
+        where: { userId_externalId: { userId: req.user.userId, externalId: ticketId } },
+        update: updateData,
+        create: {
+          userId:           req.user.userId,
+          externalId:       ticketId,
+          customerName:     'Unknown',
+          customerEmail:    'unknown@email.com',
+          subject:          ticketSubject || 'No Subject',
+          content:          ticketContent || '',
+          channel:          'gmail',
+          status:           draftObj.status === 'escalated' ? 'escalated' : 'new',
+          sentiment,
+          escalationReason: draftObj.reason || null,
+        }
+      }).catch(e => console.error('Ticket upsert:', e.message));
+    }
+
     res.json(draftObj);
   } catch (error) {
-    console.error('Draft Error:', error);
+    console.error('Draft Error:', error?.message || error);
     res.status(500).json({ error: 'Failed to generate draft' });
   }
 });
