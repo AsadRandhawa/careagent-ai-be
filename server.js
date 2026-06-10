@@ -258,7 +258,7 @@ app.get('/api/gmail/emails', authenticateToken, async (req, res) => {
         subject,
         time:         timeString,
         createdAt,
-        status:       (dbTicket?.status === 'resolved') ? 'resolved' : 'new',
+        status:       (dbTicket?.status === 'resolved') ? 'resolved' : (dbTicket?.status === 'escalated') ? 'escalated' : 'new',
         hasDraft:     true,
         avatarVariant: ['blue', 'purple', 'green', 'orange'][Math.floor(Math.random() * 4)],
         email:        emailAddress,
@@ -271,6 +271,33 @@ app.get('/api/gmail/emails', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Failed to fetch emails:', error);
     res.status(500).json({ error: 'Failed to fetch emails.' });
+  }
+});
+
+// Manual escalate — persist to DB
+app.post('/api/tickets/escalate', authenticateToken, async (req, res) => {
+  try {
+    const { ticketId, subject, customerName, customerEmail, content, threadId, reason } = req.body;
+    await prisma.ticket.upsert({
+      where: { userId_externalId: { userId: req.user.userId, externalId: ticketId } },
+      update: { status: 'escalated', escalationReason: reason || 'Manually escalated' },
+      create: {
+        userId:           req.user.userId,
+        externalId:       ticketId,
+        threadId:         threadId || null,
+        customerName:     customerName || 'Unknown',
+        customerEmail:    customerEmail || 'unknown@email.com',
+        subject:          subject || 'No Subject',
+        content:          content || '',
+        channel:          'gmail',
+        status:           'escalated',
+        escalationReason: reason || 'Manually escalated',
+      }
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Escalate error:', err.message);
+    res.status(500).json({ error: 'Failed to escalate ticket' });
   }
 });
 
