@@ -274,6 +274,21 @@ app.get('/api/gmail/emails', authenticateToken, async (req, res) => {
   }
 });
 
+// Dismiss escalation — reset ticket to new or in_progress
+app.post('/api/tickets/dismiss', authenticateToken, async (req, res) => {
+  try {
+    const { ticketId, status = 'new' } = req.body;
+    await prisma.ticket.updateMany({
+      where: { userId: req.user.userId, externalId: ticketId },
+      data: { status, escalationReason: null }
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Dismiss error:', err.message);
+    res.status(500).json({ error: 'Failed to dismiss ticket' });
+  }
+});
+
 // Manual escalate — persist to DB
 app.post('/api/tickets/escalate', authenticateToken, async (req, res) => {
   try {
