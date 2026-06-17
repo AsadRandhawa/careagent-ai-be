@@ -3,6 +3,8 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { OpenAI } from 'openai';
 import { google } from 'googleapis';
+import Stripe from 'stripe';
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '');
 import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -590,6 +592,122 @@ app.get('/api/tickets/insights', authenticateToken, async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch insights.' });
+  }
+});
+
+
+// ═══════════════════════════════════════════════════════════
+// STRIPE ROUTES
+// ═══════════════════════════════════════════════════════════
+
+// Create Checkout Session
+app.post('/api/stripe/create-checkout', authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const frontendUrl = process.env.FRONTEND_URL || 'https://careagent.flint-sol.com';
+
+    // Create or retrieve Stripe customer
+    let customerId = user.stripeCustomerId;
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: user.email,
+        metadata: { userId: user.id }
+      });
+      customerId = customer.id;
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { stripeCustomerId: customerId }
+      });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      customer: customerId,
+      payment_method_types: ['card'],
+      line_items: [{
+        price: process.env.STRIPE_GROWTH_PRICE_ID,
+        quantity: 1,
+      }],
+      mode: 'subscription',
+      success_url: `${frontendUrl}/dashboard?plan=growth&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${frontendUrl}/#pricing`,
+      metadata: { userId: user.id },
+    });
+
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error('Stripe checkout error:', err.message);
+    res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
+// Stripe Webhook — handle payment events
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET || '');
+  } catch (err) {
+    console.error('Webhook signature error:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const userId = session.metadata?.userId;
+    if (userId) {
+      await prisma.user.update({
+        where: { id: userId },
+        data: {
+          plan: 'growth',
+          stripeSubscriptionId: session.subscription,
+        }
+      }).catch(console.error);
+    }
+  }
+
+  if (event.type === 'customer.subscription.deleted') {
+    const subscription = event.data.object;
+    await prisma.user.updateMany({
+      where: { stripeSubscriptionId: subscription.id },
+      data: { plan: 'startup', stripeSubscriptionId: null }
+    }).catch(console.error);
+  }
+
+  res.json({ received: true });
+});
+
+// Customer billing portal
+app.post('/api/stripe/portal', authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
+    if (!user?.stripeCustomerId) return res.status(400).json({ error: 'No billing account found' });
+
+    const frontendUrl = process.env.FRONTEND_URL || 'https://careagent.flint-sol.com';
+    const portalSession = await stripe.billingPortal.sessions.create({
+      customer: user.stripeCustomerId,
+      return_url: `${frontendUrl}/dashboard`,
+    });
+
+    res.json({ url: portalSession.url });
+  } catch (err) {
+    console.error('Portal error:', err.message);
+    res.status(500).json({ error: 'Failed to open billing portal' });
+  }
+});
+
+// Get current plan
+app.get('/api/stripe/plan', authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.userId },
+      select: { plan: true, stripeCustomerId: true }
+    });
+    res.json({ plan: user?.plan || 'startup' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch plan' });
   }
 });
 

@@ -23,6 +23,11 @@ model User {
   whatsappWabaId        String?
   tickets               Ticket[]
 
+  // Stripe billing
+  stripeCustomerId      String?
+  stripeSubscriptionId  String?
+  plan                  String    @default("startup") // startup | growth | enterprise
+
   // Channel preferences
   gmailEnabled          Boolean   @default(true)
 
