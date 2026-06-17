@@ -15,7 +15,8 @@
     "express":        "^4.21.2",
     "googleapis":     "^172.0.0",
     "jsonwebtoken":   "^9.0.3",
-    "openai":         "^6.39.0"
+    "openai":         "^6.39.0",
+    "stripe":         "^14.0.0"
   },
   "devDependencies": {
     "prisma": "^5.22.0"
