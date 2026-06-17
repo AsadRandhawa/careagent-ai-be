@@ -630,7 +630,7 @@ app.post('/api/stripe/create-checkout', authenticateToken, async (req, res) => {
         quantity: 1,
       }],
       mode: 'subscription',
-      success_url: `${frontendUrl}/dashboard?plan=growth&session_id={CHECKOUT_SESSION_ID}`,
+      success_url: `${frontendUrl}/billing?plan=growth&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${frontendUrl}/#pricing`,
       metadata: { userId: user.id },
     });
@@ -695,6 +695,31 @@ app.post('/api/stripe/portal', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('Portal error:', err.message);
     res.status(500).json({ error: 'Failed to open billing portal' });
+  }
+});
+
+// Sync plan from Stripe session (called after successful checkout)
+app.post('/api/stripe/sync-session', authenticateToken, async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    if (!sessionId) return res.json({ success: false });
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    if (session.payment_status === 'paid' || session.status === 'complete') {
+      await prisma.user.update({
+        where: { id: req.user.userId },
+        data: {
+          plan: 'growth',
+          stripeSubscriptionId: session.subscription,
+          stripeCustomerId: session.customer,
+        }
+      });
+      return res.json({ success: true, plan: 'growth' });
+    }
+    res.json({ success: false });
+  } catch (err) {
+    console.error('Sync session error:', err.message);
+    res.status(500).json({ error: 'Failed to sync session' });
   }
 });
 
