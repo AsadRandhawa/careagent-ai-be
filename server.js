@@ -291,6 +291,40 @@ app.post('/api/tickets/dismiss', authenticateToken, async (req, res) => {
   }
 });
 
+// ── Paddle Webhook ───────────────────────────────────────
+app.post('/api/paddle/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const payload = JSON.parse(req.body.toString());
+    const eventType = payload.event_type;
+
+    if (eventType === 'transaction.completed' || eventType === 'subscription.activated') {
+      const customerEmail = payload.data?.customer?.email || payload.data?.billing_details?.email;
+      if (customerEmail) {
+        await prisma.user.updateMany({
+          where: { email: customerEmail },
+          data: { plan: 'growth', stripeSubscriptionId: payload.data?.subscription_id || null }
+        });
+        console.log('Paddle plan updated for:', customerEmail);
+      }
+    }
+
+    if (eventType === 'subscription.canceled') {
+      const customerEmail = payload.data?.customer?.email;
+      if (customerEmail) {
+        await prisma.user.updateMany({
+          where: { email: customerEmail },
+          data: { plan: 'startup' }
+        });
+      }
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error('Paddle webhook error:', err.message);
+    res.status(500).json({ error: 'Webhook processing failed' });
+  }
+});
+
 // Manual escalate — persist to DB
 app.post('/api/tickets/escalate', authenticateToken, async (req, res) => {
   try {
@@ -695,6 +729,19 @@ app.post('/api/stripe/portal', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('Portal error:', err.message);
     res.status(500).json({ error: 'Failed to open billing portal' });
+  }
+});
+
+// Sync plan after Paddle checkout (called from frontend after successful payment)
+app.post('/api/paddle/sync', authenticateToken, async (req, res) => {
+  try {
+    await prisma.user.update({
+      where: { id: req.user.userId },
+      data: { plan: 'growth' }
+    });
+    res.json({ success: true, plan: 'growth' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to sync plan' });
   }
 });
 
