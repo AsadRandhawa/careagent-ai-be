@@ -1,6 +1,10 @@
-import { prisma }       from '../lib/prisma.js';
-import { asyncHandler } from '../middleware/error.middleware.js';
-import { safeUser }     from '../services/auth.service.js';
+import { prisma }               from '../lib/prisma.js';
+import { asyncHandler }         from '../middleware/error.middleware.js';
+import { safeUser }             from '../services/auth.service.js';
+import {
+  storeDocumentChunks,
+  deleteAllUserChunks,
+} from '../services/knowledge.service.js';
 
 // GET /api/user/me
 export const getMe = asyncHandler(async (req, res) => {
@@ -33,15 +37,29 @@ export const getMe = asyncHandler(async (req, res) => {
 // POST /api/user/knowledge-base
 export const updateKnowledgeBase = asyncHandler(async (req, res) => {
   const { documents, businessIdentity, brandVoice } = req.body;
+  const userId = req.user.userId;
 
+  // 1. Save metadata + settings (unchanged behaviour)
   await prisma.user.update({
-    where: { id: req.user.userId },
+    where: { id: userId },
     data:  {
-      documents:        documents        || [],
-      businessIdentity: businessIdentity || null,
-      brandVoice:       brandVoice       || null,
+      documents:        documents        ?? [],
+      businessIdentity: businessIdentity ?? null,
+      brandVoice:       brandVoice       ?? null,
     },
   });
+
+  // 2. RAG: re-embed all active documents
+  if (Array.isArray(documents) && documents.length > 0) {
+    // Clear all existing chunks for this user first
+    await deleteAllUserChunks(userId);
+
+    for (const doc of documents) {
+      if (doc.status === 'Active' && doc.textContent?.trim()) {
+        await storeDocumentChunks(userId, doc.name, doc.textContent);
+      }
+    }
+  }
 
   res.json({ success: true });
 });
