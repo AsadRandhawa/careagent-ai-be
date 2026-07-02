@@ -1,20 +1,19 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector]
 }
 
 model User {
-  id                    String    @id @default(uuid())
-  email                 String    @unique
+  id                    String           @id @default(uuid())
+  email                 String           @unique
   password              String
-  documents             Json?     @default("[]")
+  documents             Json?            @default("[]")
   businessIdentity      String?
   brandVoice            String?
   googleTokens          Json?
@@ -22,62 +21,71 @@ model User {
   whatsappPhoneNumberId String?
   whatsappWabaId        String?
   tickets               Ticket[]
+  documentChunks        DocumentChunk[]
 
   // Stripe billing
   stripeCustomerId      String?
   stripeSubscriptionId  String?
-  plan                  String    @default("startup") // startup | growth | enterprise
+  plan                  String           @default("startup")
 
   // Channel preferences
-  gmailEnabled          Boolean   @default(true)
+  gmailEnabled          Boolean          @default(true)
 
   // Automation settings
-  aiAutoDrafting        Boolean   @default(true)
-  autoClassification    Boolean   @default(true)
-  sentimentTracking     Boolean   @default(false)
+  aiAutoDrafting        Boolean          @default(true)
+  autoClassification    Boolean          @default(true)
+  sentimentTracking     Boolean          @default(false)
 
-  // Sidebar badge tracking — badges show tickets newer than these timestamps
+  // Sidebar badge tracking
   lastSeenInboxAt       DateTime?
   lastSeenEscalAt       DateTime?
 
-  createdAt             DateTime  @default(now())
-  updatedAt             DateTime  @updatedAt
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
+}
+
+model DocumentChunk {
+  id        String                       @id @default(uuid())
+  userId    String
+  user      User                         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  docName   String
+  content   String
+  embedding Unsupported("vector(1536)")
+  createdAt DateTime                     @default(now())
+
+  @@index([userId])
+  @@index([userId, docName])
 }
 
 model Ticket {
-  id           String    @id @default(uuid())
-  userId       String
-  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id               String    @id @default(uuid())
+  userId           String
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  // External IDs
-  externalId   String    // Gmail message ID or WhatsApp message ID
-  threadId     String?   // Gmail thread ID
+  externalId       String
+  threadId         String?
 
-  // Customer info
-  customerName String
-  customerEmail String?
-  phoneNumber  String?
+  customerName     String
+  customerEmail    String?
+  phoneNumber      String?
 
-  // Content
-  subject      String?
-  content      String
-  channel      String    @default("gmail") // gmail | whatsapp
+  subject          String?
+  content          String
+  channel          String    @default("gmail")
 
-  // Status & classification
-  status       String    @default("new")   // new | pending | resolved | escalated
-  sentiment    String    @default("Neutral") // Positive | Neutral | Negative | Urgent
-  category     String    @default("General")
-  urgency      Int       @default(1)       // 1-5
+  status           String    @default("new")
+  sentiment        String    @default("Neutral")
+  category         String    @default("General")
+  urgency          Int       @default(1)
 
   escalationReason String?
 
-  // Timestamps
-  receivedAt   DateTime  @default(now())
-  resolvedAt   DateTime?
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
+  receivedAt       DateTime  @default(now())
+  resolvedAt       DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
 
-  @@unique([userId, externalId])           // prevent duplicate syncs
+  @@unique([userId, externalId])
   @@index([userId, status])
   @@index([userId, receivedAt])
   @@index([userId, channel])
