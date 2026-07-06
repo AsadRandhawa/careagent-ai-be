@@ -8,6 +8,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '');
 import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -780,6 +781,215 @@ app.get('/api/stripe/plan', authenticateToken, async (req, res) => {
     res.json({ plan: user?.plan || 'startup' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch plan' });
+  }
+});
+
+
+// ═══════════════════════════════════════════════════════════
+// LIVE CHAT — Widget + Real-time Chat Routes
+// ═══════════════════════════════════════════════════════════
+
+// Allow any origin for livechat routes (widget runs on 3rd-party sites)
+app.use(['/api/livechat', '/widget.js'], (req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+// GET /widget.js — serve embeddable chat widget
+app.get('/widget.js', (req, res) => {
+  const API = (process.env.VITE_API_URL || 'https://careagent-ai-be-production.up.railway.app').replace(/\/$/, '');
+  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.send(buildWidget(API));
+});
+
+function buildWidget(API) {
+  return `(function(){
+var _A='${API}',_sc=document.currentScript||[...document.querySelectorAll('script[data-token]')].pop();
+if(!_sc)return;
+var _tok=_sc.getAttribute('data-token'),_nm=_sc.getAttribute('data-name')||'Support',_col=_sc.getAttribute('data-color')||'#3B82F6';
+if(!_tok)return;
+var _sid=localStorage.getItem('_ca_sid_'+_tok),_vid=localStorage.getItem('_ca_vid')||(function(){var v='v_'+Math.random().toString(36).substr(2,9);localStorage.setItem('_ca_vid',v);return v;})(),_vname=localStorage.getItem('_ca_nm_'+_tok)||'',_named=!!_vname,_open=false,_last=null,_poll=null,_unread=0;
+var _css='.ca-w{position:fixed;bottom:24px;right:24px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}.ca-btn{width:56px;height:56px;border-radius:50%;background:'+_col+';border:none;cursor:pointer;box-shadow:0 4px 20px rgba(0,0,0,.2);display:flex;align-items:center;justify-content:center;transition:transform .2s;position:relative}.ca-btn:hover{transform:scale(1.08)}.ca-bdg{position:absolute;top:-3px;right:-3px;background:#EF4444;color:#fff;border-radius:50%;min-width:18px;height:18px;font-size:10px;font-weight:700;display:none;align-items:center;justify-content:center;padding:0 3px}.ca-pnl{position:absolute;bottom:68px;right:0;width:340px;height:500px;background:#fff;border-radius:16px;box-shadow:0 12px 48px rgba(0,0,0,.18);display:flex;flex-direction:column;overflow:hidden;transition:transform .25s cubic-bezier(.4,0,.2,1),opacity .25s;transform-origin:bottom right}.ca-pnl.off{transform:scale(.9) translateY(8px);opacity:0;pointer-events:none}.ca-hd{background:'+_col+';padding:14px 16px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}.ca-ht{color:#fff;font-size:15px;font-weight:600;margin:0}.ca-hs{color:rgba(255,255,255,.75);font-size:11px;margin:2px 0 0}.ca-cx{background:none;border:none;cursor:pointer;color:#fff;opacity:.8;padding:4px;border-radius:6px;display:flex}.ca-cx:hover{opacity:1;background:rgba(255,255,255,.15)}.ca-ms{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}.ca-ms::-webkit-scrollbar{width:4px}.ca-ms::-webkit-scrollbar-thumb{background:#E5E7EB;border-radius:4px}.ca-mg{max-width:82%;display:flex;flex-direction:column}.ca-mg.v{align-self:flex-end;align-items:flex-end}.ca-mg.a{align-self:flex-start;align-items:flex-start}.ca-bb{padding:9px 13px;border-radius:14px;font-size:13px;line-height:1.45;word-break:break-word}.ca-mg.v .ca-bb{background:'+_col+';color:#fff;border-bottom-right-radius:4px}.ca-mg.a .ca-bb{background:#F3F4F6;color:#111827;border-bottom-left-radius:4px}.ca-ts{font-size:10px;color:#9CA3AF;margin-top:3px}.ca-nf{padding:12px 14px;border-top:1px solid #F3F4F6;flex-shrink:0}.ca-nf p{font-size:12px;color:#6B7280;margin:0 0 6px}.ca-nr{display:flex;gap:8px}.ca-ni{flex:1;border:1px solid #E5E7EB;border-radius:8px;padding:8px 10px;font-size:13px;outline:none;font-family:inherit}.ca-ni:focus{border-color:'+_col+'}.ca-ia{padding:10px 12px;border-top:1px solid #F3F4F6;display:flex;gap:8px;align-items:flex-end;flex-shrink:0}.ca-inp{flex:1;border:1px solid #E5E7EB;border-radius:10px;padding:8px 11px;font-size:13px;outline:none;resize:none;height:38px;max-height:96px;font-family:inherit;transition:border-color .15s;line-height:1.4}.ca-inp:focus{border-color:'+_col+'}.ca-sb{width:36px;height:36px;min-width:36px;border-radius:10px;background:'+_col+';border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:opacity .15s}.ca-sb:hover{opacity:.85}.ca-em{text-align:center;padding:32px 14px}.ca-em svg{margin:0 auto;display:block}.ca-em p{color:#9CA3AF;font-size:13px;line-height:1.6;margin:10px 0 0}';
+var _s=document.createElement('style');_s.textContent=_css;document.head.appendChild(_s);
+var _c=document.createElement('div');_c.className='ca-w';
+_c.innerHTML='<div class="ca-pnl off"><div class="ca-hd"><div><p class="ca-ht">'+_nm+'</p><p class="ca-hs">Typically replies in minutes</p></div><button class="ca-cx" id="_ca_cx"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div><div class="ca-ms" id="_ca_ms"><div class="ca-em" id="_ca_em"><svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="'+_col+'" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><p>Hi! How can we help you today?</p></div></div><div class="ca-nf" id="_ca_nf" style="display:'+(_named?'none':'block')+'"><p>What's your name?</p><div class="ca-nr"><input class="ca-ni" id="_ca_ni" placeholder="Your name..." /><button class="ca-sb" id="_ca_ns"><svg width="15" height="15" viewBox="0 0 24 24" fill="white"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg></button></div></div><div class="ca-ia" id="_ca_ia" style="display:'+(_named?'flex':'none')+'"><textarea class="ca-inp" id="_ca_inp" placeholder="Type a message..." rows="1"></textarea><button class="ca-sb" id="_ca_sd"><svg width="15" height="15" viewBox="0 0 24 24" fill="white"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg></button></div></div><button class="ca-btn" id="_ca_btn"><div class="ca-bdg" id="_ca_bdg"></div><svg id="_ca_ic" width="22" height="22" viewBox="0 0 24 24" fill="white"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><svg id="_ca_ix" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" style="display:none"><path d="M18 6L6 18M6 6l12 12"/></svg></button>';
+document.body.appendChild(_c);
+var _$=function(id){return document.getElementById(id);};
+function _ft(ts){return new Date(ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
+function _rm(m){var d=document.createElement('div');d.className='ca-mg '+(m.role==='visitor'?'v':'a');d.innerHTML='<div class="ca-bb">'+m.content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>')+'</div><div class="ca-ts">'+_ft(m.createdAt)+'</div>';return d;}
+function _add(m){var ms=_$('_ca_ms'),em=_$('_ca_em');if(em)em.remove();ms.appendChild(_rm(m));ms.scrollTop=ms.scrollHeight;}
+function _bdg(n){_unread=n;var b=_$('_ca_bdg');if(n>0&&!_open){b.textContent=n>9?'9+':n;b.style.display='flex';}else{b.style.display='none';}}
+async function _is(){try{var r=await fetch(_A+'/api/livechat/session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({livechatToken:_tok,visitorId:_vid,visitorName:_vname})});var d=await r.json();_sid=d.sessionId;localStorage.setItem('_ca_sid_'+_tok,_sid);(d.messages||[]).forEach(function(m){_add(m);});if(d.messages&&d.messages.length)_last=d.messages[d.messages.length-1].createdAt;_sp();}catch(e){console.error('[CA]',e);}}
+async function _snd(t){if(!t.trim()||!_sid)return;_add({role:'visitor',content:t,createdAt:new Date().toISOString()});try{await fetch(_A+'/api/livechat/message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:_sid,content:t})});}catch(e){}}
+function _sp(){if(_poll)return;_poll=setInterval(async function(){if(!_sid)return;try{var p=_last?'?after='+encodeURIComponent(_last):'';var r=await fetch(_A+'/api/livechat/poll/'+_sid+p);var d=await r.json();if(d.messages&&d.messages.length){d.messages.forEach(function(m){_add(m);if(!_open)_bdg(_unread+1);});_last=d.messages[d.messages.length-1].createdAt;}}catch(e){}},3000);}
+function _tg(){_open=!_open;var pnl=_c.querySelector('.ca-pnl');if(_open){pnl.classList.remove('off');_$('_ca_ic').style.display='none';_$('_ca_ix').style.display='block';_bdg(0);if(!_sid&&_named)_is();}else{pnl.classList.add('off');_$('_ca_ic').style.display='block';_$('_ca_ix').style.display='none';}}
+_$('_ca_btn').onclick=_tg;_$('_ca_cx').onclick=_tg;
+_$('_ca_ns').onclick=async function(){var n=_$('_ca_ni').value.trim();if(!n)return;_vname=n;_named=true;localStorage.setItem('_ca_nm_'+_tok,n);_$('_ca_nf').style.display='none';_$('_ca_ia').style.display='flex';await _is();};
+_$('_ca_ni').onkeydown=function(e){if(e.key==='Enter')_$('_ca_ns').click();};
+function _ds(){var inp=_$('_ca_inp');var t=inp.value.trim();if(!t)return;inp.value='';inp.style.height='38px';_snd(t);}
+_$('_ca_sd').onclick=_ds;
+_$('_ca_inp').onkeydown=function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();_ds();}};
+_$('_ca_inp').oninput=function(){this.style.height='38px';this.style.height=Math.min(this.scrollHeight,96)+'px';};
+if(_sid&&_named)_sp();
+})();`;
+}
+
+// POST /api/livechat/token — generate/get embed token (authenticated)
+app.post('/api/livechat/token', authenticateToken, async (req, res) => {
+  try {
+    let user = await prisma.user.findUnique({ where: { id: req.user.userId } });
+    let lct = user.livechatToken;
+    if (!lct) {
+      lct = crypto.randomBytes(16).toString('hex');
+      await prisma.user.update({ where: { id: req.user.userId }, data: { livechatToken: lct, livechatEnabled: true } });
+    }
+    const base = (process.env.VITE_API_URL || 'https://careagent-ai-be-production.up.railway.app').replace(/\/$/, '');
+    res.json({
+      token: lct,
+      embedCode: `<script src="${base}/widget.js" data-token="${lct}" data-name="Support"></script>`,
+    });
+  } catch (err) {
+    console.error('[livechat/token]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/livechat/session — create/resume session (public)
+app.post('/api/livechat/session', async (req, res) => {
+  try {
+    const { livechatToken, visitorId, visitorName } = req.body;
+    if (!livechatToken || !visitorId) return res.status(400).json({ error: 'livechatToken and visitorId required' });
+    const user = await prisma.user.findUnique({ where: { livechatToken } });
+    if (!user) return res.status(404).json({ error: 'Invalid token' });
+    let session = await prisma.chatSession.findFirst({
+      where: { userId: user.id, visitorId, status: 'active' },
+      include: { messages: { orderBy: { createdAt: 'asc' } } },
+    });
+    if (!session) {
+      session = await prisma.chatSession.create({
+        data: { userId: user.id, visitorId, visitorName: visitorName || 'Visitor' },
+        include: { messages: true },
+      });
+    }
+    res.json({ sessionId: session.id, messages: session.messages });
+  } catch (err) {
+    console.error('[livechat/session]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/livechat/message — visitor sends message (public)
+app.post('/api/livechat/message', async (req, res) => {
+  try {
+    const { sessionId, content } = req.body;
+    if (!sessionId || !content?.trim()) return res.status(400).json({ error: 'sessionId and content required' });
+    const session = await prisma.chatSession.findUnique({ where: { id: sessionId } });
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    const message = await prisma.chatMessage.create({ data: { sessionId, role: 'visitor', content: content.trim() } });
+    await prisma.chatSession.update({ where: { id: sessionId }, data: { updatedAt: new Date() } });
+    res.json({ message });
+  } catch (err) {
+    console.error('[livechat/message]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/livechat/poll/:sessionId — visitor polls for agent replies (public)
+app.get('/api/livechat/poll/:sessionId', async (req, res) => {
+  try {
+    const { after } = req.query;
+    const messages = await prisma.chatMessage.findMany({
+      where: {
+        sessionId: req.params.sessionId,
+        role: 'agent',
+        ...(after ? { createdAt: { gt: new Date(after) } } : {}),
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+    res.json({ messages });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/livechat/tickets — all active sessions as inbox tickets (authenticated)
+app.get('/api/livechat/tickets', authenticateToken, async (req, res) => {
+  try {
+    const sessions = await prisma.chatSession.findMany({
+      where: { userId: req.user.userId, status: 'active' },
+      include: { messages: { orderBy: { createdAt: 'desc' }, take: 1 } },
+      orderBy: { updatedAt: 'desc' },
+    });
+    const tickets = sessions.map(s => ({
+      id:           s.id,
+      customerName: s.visitorName || 'Website Visitor',
+      initials:     (s.visitorName || 'WV').substring(0, 2).toUpperCase(),
+      subject:      'Live Chat',
+      content:      s.messages[0]?.content || 'Started a chat',
+      time:         new Date(s.updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      createdAt:    s.createdAt.toISOString(),
+      status:       'new',
+      hasDraft:     true,
+      avatarVariant: 'teal',
+      channel:      'website',
+      sessionId:    s.id,
+    }));
+    res.json(tickets);
+  } catch (err) {
+    console.error('[livechat/tickets]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/livechat/messages/:sessionId — full conversation (authenticated)
+app.get('/api/livechat/messages/:sessionId', authenticateToken, async (req, res) => {
+  try {
+    const session = await prisma.chatSession.findFirst({
+      where: { id: req.params.sessionId, userId: req.user.userId },
+    });
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    const messages = await prisma.chatMessage.findMany({
+      where: { sessionId: req.params.sessionId },
+      orderBy: { createdAt: 'asc' },
+    });
+    res.json({ messages });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/livechat/reply — agent sends reply (authenticated)
+app.post('/api/livechat/reply', authenticateToken, async (req, res) => {
+  try {
+    const { sessionId, content } = req.body;
+    if (!sessionId || !content?.trim()) return res.status(400).json({ error: 'sessionId and content required' });
+    const session = await prisma.chatSession.findFirst({
+      where: { id: sessionId, userId: req.user.userId },
+    });
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    const message = await prisma.chatMessage.create({ data: { sessionId, role: 'agent', content: content.trim() } });
+    res.json({ success: true, message });
+  } catch (err) {
+    console.error('[livechat/reply]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/livechat/resolve — close a session (authenticated)
+app.post('/api/livechat/resolve', authenticateToken, async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    await prisma.chatSession.update({
+      where: { id: sessionId, userId: req.user.userId },
+      data: { status: 'resolved' },
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
