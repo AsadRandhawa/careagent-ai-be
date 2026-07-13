@@ -22,7 +22,9 @@ app.use(cors({
   ],
   credentials: true,
 }));
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => { req.rawBody = buf; },
+}));
 
 
 const prisma = new PrismaClient();
@@ -945,18 +947,24 @@ app.post('/api/facebook/webhook', async (req, res) => {
   res.sendStatus(200); // ack immediately — Meta retries aggressively on non-200
 
   try {
+    console.log('[Facebook] Webhook payload received:', JSON.stringify(req.body));
+
     const signature = req.headers['x-hub-signature-256'];
-    if (process.env.META_APP_SECRET && signature) {
+    if (process.env.META_APP_SECRET && signature && req.rawBody) {
       const expected = 'sha256=' + crypto
         .createHmac('sha256', process.env.META_APP_SECRET)
-        .update(JSON.stringify(req.body))
+        .update(req.rawBody)
         .digest('hex');
       const sigBuf = Buffer.from(signature);
       const expBuf = Buffer.from(expected);
       if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
-        console.warn('[Facebook] Invalid webhook signature — ignoring');
+        console.warn('[Facebook] Invalid webhook signature — ignoring. Got:', signature, 'Expected:', expected);
         return;
       }
+    } else {
+      console.warn('[Facebook] Skipping signature check — missing secret, header, or rawBody', {
+        hasSecret: !!process.env.META_APP_SECRET, hasSig: !!signature, hasRawBody: !!req.rawBody,
+      });
     }
 
     for (const entry of req.body.entry || []) {
