@@ -109,6 +109,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
         googleTokens: true, gmailEnabled: true,
         aiAutoDrafting: true, autoClassification: true, sentimentTracking: true,
         lastSeenInboxAt: true, lastSeenEscalAt: true,
+        facebookConnected: true, facebookPageName: true,
       }
     });
     res.set('Cache-Control', 'no-store');
@@ -116,6 +117,8 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
       id: user.id,
       email: user.email,
       googleConnected:    !!user.googleTokens,
+      facebookConnected:  user.facebookConnected  ?? false,
+      facebookPageName:   user.facebookPageName    ?? null,
       gmailEnabled:       user.gmailEnabled       ?? true,
       aiAutoDrafting:     user.aiAutoDrafting     ?? true,
       autoClassification: user.autoClassification ?? true,
@@ -178,6 +181,19 @@ app.delete('/api/user/disconnect/gmail', authenticateToken, async (req, res) => 
   }
 });
 
+// Disconnect Facebook
+app.delete('/api/user/disconnect/facebook', authenticateToken, async (req, res) => {
+  try {
+    await prisma.user.update({
+      where: { id: req.user.userId },
+      data: { facebookPageId: null, facebookPageName: null, facebookPageToken: null, facebookConnected: false }
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to disconnect Facebook.' });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════
 // GOOGLE OAUTH
 // ═══════════════════════════════════════════════════════════
@@ -215,6 +231,92 @@ app.get('/api/auth/google/callback', async (req, res) => {
     res.redirect(`${frontendUrl}/channels?connected=gmail`);
   } catch (error) {
     console.error('Google Auth Error:', error);
+    res.redirect(`${frontendUrl}/channels?error=auth_failed`);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// FACEBOOK OAUTH (Connect Page)
+// ═══════════════════════════════════════════════════════════
+
+app.get('/api/auth/facebook', (req, res) => {
+  const token = req.query.token;
+  const params = new URLSearchParams({
+    client_id: process.env.META_APP_ID,
+    redirect_uri: process.env.FACEBOOK_REDIRECT_URI,
+    state: token || '',
+    scope: 'pages_show_list,pages_messaging,pages_manage_metadata,pages_read_engagement',
+    response_type: 'code',
+  });
+  res.redirect(`https://www.facebook.com/v19.0/dialog/oauth?${params}`);
+});
+
+app.get('/api/auth/facebook/callback', async (req, res) => {
+  const { code, state } = req.query;
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  try {
+    if (!code) throw new Error('No code returned from Facebook');
+
+    // 1. Exchange code for a short-lived user token
+    const tokenRes = await fetch(
+      `https://graph.facebook.com/v19.0/oauth/access_token?` +
+      new URLSearchParams({
+        client_id: process.env.META_APP_ID,
+        client_secret: process.env.META_APP_SECRET,
+        redirect_uri: process.env.FACEBOOK_REDIRECT_URI,
+        code,
+      })
+    );
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) throw new Error(tokenData.error?.message || 'Token exchange failed');
+
+    // 2. Exchange for a long-lived user token (~60 days)
+    const longLivedRes = await fetch(
+      `https://graph.facebook.com/v19.0/oauth/access_token?` +
+      new URLSearchParams({
+        grant_type: 'fb_exchange_token',
+        client_id: process.env.META_APP_ID,
+        client_secret: process.env.META_APP_SECRET,
+        fb_exchange_token: tokenData.access_token,
+      })
+    );
+    const longLivedData = await longLivedRes.json();
+    const longLivedToken = longLivedData.access_token || tokenData.access_token;
+
+    // 3. Get the Pages this user manages
+    const pagesRes = await fetch(
+      `https://graph.facebook.com/v19.0/me/accounts?access_token=${longLivedToken}`
+    );
+    const pagesData = await pagesRes.json();
+    const page = pagesData.data?.[0]; // first Page — extend to a picker later if user has multiple
+    if (!page) throw new Error('No Facebook Page found for this account');
+
+    // 4. Subscribe the app to this Page's webhooks
+    await fetch(`https://graph.facebook.com/v19.0/${page.id}/subscribed_apps`, {
+      method: 'POST',
+      body: new URLSearchParams({
+        subscribed_fields: 'messages,messaging_postbacks',
+        access_token: page.access_token,
+      }),
+    });
+
+    // 5. Save to DB
+    if (state) {
+      const decoded = jwt.verify(state, process.env.JWT_SECRET || 'secret_key');
+      await prisma.user.update({
+        where: { id: decoded.userId },
+        data: {
+          facebookPageId: page.id,
+          facebookPageName: page.name,
+          facebookPageToken: page.access_token,
+          facebookConnected: true,
+        },
+      });
+    }
+
+    res.redirect(`${frontendUrl}/channels?connected=facebook`);
+  } catch (error) {
+    console.error('Facebook Auth Error:', error.message || error);
     res.redirect(`${frontendUrl}/channels?error=auth_failed`);
   }
 });
@@ -784,6 +886,154 @@ app.get('/api/stripe/plan', authenticateToken, async (req, res) => {
   }
 });
 
+
+// ═══════════════════════════════════════════════════════════
+// FACEBOOK MESSENGER — Webhook + Tickets + Reply
+// ═══════════════════════════════════════════════════════════
+
+// GET — Meta webhook verification challenge
+app.get('/api/facebook/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const verifyToken = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && verifyToken === process.env.FACEBOOK_WEBHOOK_VERIFY_TOKEN) {
+    console.log('[Facebook] Webhook verified ✅');
+    return res.status(200).send(challenge);
+  }
+  res.sendStatus(403);
+});
+
+// POST — incoming Messenger events from Meta (public, signature-checked)
+app.post('/api/facebook/webhook', async (req, res) => {
+  res.sendStatus(200); // ack immediately — Meta retries aggressively on non-200
+
+  try {
+    const signature = req.headers['x-hub-signature-256'];
+    if (process.env.META_APP_SECRET && signature) {
+      const expected = 'sha256=' + crypto
+        .createHmac('sha256', process.env.META_APP_SECRET)
+        .update(JSON.stringify(req.body))
+        .digest('hex');
+      const sigBuf = Buffer.from(signature);
+      const expBuf = Buffer.from(expected);
+      if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+        console.warn('[Facebook] Invalid webhook signature — ignoring');
+        return;
+      }
+    }
+
+    for (const entry of req.body.entry || []) {
+      const pageId = entry.id;
+      for (const event of entry.messaging || []) {
+        if (!event.message || event.message.is_echo) continue; // skip our own sent messages
+
+        const senderId = event.sender.id;
+        const text = event.message.text || '[Attachment received]';
+
+        const user = await prisma.user.findFirst({ where: { facebookPageId: pageId } });
+        if (!user) continue;
+
+        let customerName = senderId;
+        try {
+          const profileRes = await fetch(
+            `https://graph.facebook.com/v19.0/${senderId}?fields=name&access_token=${user.facebookPageToken}`
+          );
+          const profile = await profileRes.json();
+          if (profile.name) customerName = profile.name;
+        } catch (_) {}
+
+        await prisma.ticket.upsert({
+          where: { userId_externalId: { userId: user.id, externalId: event.message.mid } },
+          update: {},
+          create: {
+            userId: user.id,
+            externalId: event.message.mid,
+            threadId: senderId, // Messenger PSID — used to route replies
+            customerName,
+            customerEmail: null,
+            subject: 'Facebook Messenger',
+            content: text,
+            channel: 'facebook',
+            status: 'new',
+            sentiment: 'Neutral',
+            category: 'General',
+            receivedAt: new Date(event.timestamp),
+          },
+        });
+      }
+    }
+  } catch (err) {
+    console.error('[Facebook] Webhook processing error:', err.message);
+  }
+});
+
+// GET — Facebook tickets from DB (authenticated, merged into inbox by store.ts)
+app.get('/api/facebook/tickets', authenticateToken, async (req, res) => {
+  try {
+    const tickets = await prisma.ticket.findMany({
+      where: { userId: req.user.userId, channel: 'facebook' },
+      orderBy: { receivedAt: 'desc' },
+    });
+    res.json(tickets.map(t => ({
+      id: t.externalId,
+      threadId: t.threadId,
+      customerName: t.customerName,
+      initials: (t.customerName || 'U').substring(0, 2).toUpperCase(),
+      subject: t.subject || 'Facebook Messenger',
+      content: t.content,
+      time: new Date(t.receivedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      createdAt: t.receivedAt.toISOString(),
+      status: t.status,
+      hasDraft: true,
+      avatarVariant: 'blue',
+      channel: 'facebook',
+      category: t.category,
+      sentiment: t.sentiment,
+    })));
+  } catch (err) {
+    console.error('[facebook/tickets]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST — agent sends reply via Send API, marks ticket resolved (authenticated)
+app.post('/api/facebook/reply', authenticateToken, async (req, res) => {
+  try {
+    const { ticketId, threadId, body } = req.body;
+    if (!threadId || !body?.trim()) return res.status(400).json({ error: 'threadId and body required' });
+
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
+    if (!user?.facebookPageToken) return res.status(400).json({ error: 'Facebook not connected' });
+
+    const sendRes = await fetch(
+      `https://graph.facebook.com/v19.0/me/messages?access_token=${user.facebookPageToken}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recipient: { id: threadId },
+          message: { text: body },
+        }),
+      }
+    );
+    if (!sendRes.ok) {
+      const err = await sendRes.json();
+      throw new Error(err?.error?.message || 'Send failed');
+    }
+
+    if (ticketId) {
+      await prisma.ticket.updateMany({
+        where: { userId: req.user.userId, externalId: ticketId },
+        data: { status: 'resolved', resolvedAt: new Date() },
+      });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Facebook reply error:', error.message);
+    res.status(500).json({ error: 'Failed to send reply' });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════
 // LIVE CHAT — Widget + Real-time Chat Routes
