@@ -20,6 +20,13 @@ model User {
   whatsappToken         String?
   whatsappPhoneNumberId String?
   whatsappWabaId        String?
+
+  // Facebook Messenger
+  facebookPageId        String?
+  facebookPageName      String?
+  facebookPageToken     String?
+  facebookConnected     Boolean        @default(false)
+
   tickets               Ticket[]
   documentChunks        DocumentChunk[]
   chatSessions          ChatSession[]
