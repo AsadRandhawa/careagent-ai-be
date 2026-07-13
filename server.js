@@ -646,17 +646,52 @@ const analyzeSentiment = (text) => {
 
 app.post('/api/ai/draft', authenticateToken, async (req, res) => {
   try {
-    const { messages, ticketId, ticketContent, ticketSubject } = req.body;
+    const { customerName, customerMessage, customInstructions, ticketId, ticketContent, ticketSubject } = req.body;
+
+    // Pull knowledge base / brand context for this user so the draft is grounded
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.userId },
+      select: { businessIdentity: true, brandVoice: true, documents: true },
+    });
+
+    const kbSnippets = Array.isArray(user?.documents)
+      ? user.documents
+          .map(d => d?.textContent)
+          .filter(Boolean)
+          .join('\n\n')
+          .slice(0, 6000) // keep prompt size sane
+      : '';
+
+    const systemPrompt = `You are an AI customer support agent.
+Business context: ${user?.businessIdentity || 'A growing company that values fast, helpful support.'}
+Brand voice: ${user?.brandVoice || 'Professional, concise, but friendly.'}
+${kbSnippets ? `Relevant knowledge base content:\n${kbSnippets}` : 'No knowledge base content available — answer using general best practice, and escalate if the answer requires specific business knowledge you do not have.'}
+
+Respond ONLY with a JSON object in this exact shape:
+{
+  "status": "draft" | "escalated",
+  "draft": "the drafted reply text (required if status is draft)",
+  "reason": "why this needs human escalation (required if status is escalated)"
+}
+Escalate when the customer's request needs information outside the knowledge base, involves a refund/complaint requiring judgment, or expresses strong frustration.`;
+
+    const userPrompt = `Customer name: ${customerName || 'Unknown'}
+Customer message: ${customerMessage || ticketContent || ''}
+${customInstructions ? `Additional instructions for this draft: ${customInstructions}` : ''}`;
+
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       response_format: { type: 'json_object' },
-      messages,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
     });
     const draftObj = JSON.parse(response.choices[0]?.message?.content || '{}');
 
     // Persist escalation status + sentiment to DB
     if (ticketId) {
-      const sentiment = analyzeSentiment((ticketContent || '') + ' ' + (ticketSubject || ''));
+      const sentiment = analyzeSentiment((customerMessage || ticketContent || '') + ' ' + (ticketSubject || ''));
       const updateData = { sentiment };
       if (draftObj.status === 'escalated') {
         updateData.status = 'escalated';
@@ -668,10 +703,10 @@ app.post('/api/ai/draft', authenticateToken, async (req, res) => {
         create: {
           userId:           req.user.userId,
           externalId:       ticketId,
-          customerName:     'Unknown',
+          customerName:     customerName || 'Unknown',
           customerEmail:    'unknown@email.com',
           subject:          ticketSubject || 'No Subject',
-          content:          ticketContent || '',
+          content:          customerMessage || ticketContent || '',
           channel:          'gmail',
           status:           draftObj.status === 'escalated' ? 'escalated' : 'new',
           sentiment,
