@@ -109,7 +109,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
         googleTokens: true, gmailEnabled: true,
         aiAutoDrafting: true, autoClassification: true, sentimentTracking: true,
         lastSeenInboxAt: true, lastSeenEscalAt: true,
-        facebookConnected: true, facebookPageName: true,
+        facebookConnected: true, facebookPageName: true, facebookEnabled: true,
       }
     });
     res.set('Cache-Control', 'no-store');
@@ -119,6 +119,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
       googleConnected:    !!user.googleTokens,
       facebookConnected:  user.facebookConnected  ?? false,
       facebookPageName:   user.facebookPageName    ?? null,
+      facebookEnabled:    user.facebookEnabled     ?? true,
       gmailEnabled:       user.gmailEnabled       ?? true,
       aiAutoDrafting:     user.aiAutoDrafting     ?? true,
       autoClassification: user.autoClassification ?? true,
@@ -153,9 +154,10 @@ app.post('/api/user/knowledge-base', authenticateToken, async (req, res) => {
 app.patch('/api/user/preferences', authenticateToken, async (req, res) => {
   try {
     const { gmailEnabled, lastSeenInboxAt, lastSeenEscalAt,
-            aiAutoDrafting, autoClassification, sentimentTracking } = req.body;
+            aiAutoDrafting, autoClassification, sentimentTracking, facebookEnabled } = req.body;
     const data = {};
     if (gmailEnabled          !== undefined) data.gmailEnabled          = gmailEnabled;
+    if (facebookEnabled       !== undefined) data.facebookEnabled       = facebookEnabled;
     if (aiAutoDrafting        !== undefined) data.aiAutoDrafting        = aiAutoDrafting;
     if (autoClassification    !== undefined) data.autoClassification    = autoClassification;
     if (sentimentTracking     !== undefined) data.sentimentTracking     = sentimentTracking;
@@ -186,7 +188,7 @@ app.delete('/api/user/disconnect/facebook', authenticateToken, async (req, res) 
   try {
     await prisma.user.update({
       where: { id: req.user.userId },
-      data: { facebookPageId: null, facebookPageName: null, facebookPageToken: null, facebookConnected: false }
+      data: { facebookPageId: null, facebookPageName: null, facebookPageToken: null, facebookConnected: false, facebookEnabled: true }
     });
     res.json({ success: true });
   } catch (err) {
@@ -1005,6 +1007,9 @@ app.post('/api/facebook/webhook', async (req, res) => {
 // GET — Facebook tickets from DB (authenticated, merged into inbox by store.ts)
 app.get('/api/facebook/tickets', authenticateToken, async (req, res) => {
   try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
+    if (user?.facebookEnabled === false) return res.json([]);
+
     const tickets = await prisma.ticket.findMany({
       where: { userId: req.user.userId, channel: 'facebook' },
       orderBy: { receivedAt: 'desc' },
