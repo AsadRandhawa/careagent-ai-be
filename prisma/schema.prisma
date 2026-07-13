@@ -26,6 +26,7 @@ model User {
   facebookPageName      String?
   facebookPageToken     String?
   facebookConnected     Boolean        @default(false)
+  facebookEnabled       Boolean        @default(true)
 
   tickets               Ticket[]
   documentChunks        DocumentChunk[]
