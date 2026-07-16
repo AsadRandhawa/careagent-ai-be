@@ -296,13 +296,18 @@ app.get('/api/auth/facebook/callback', async (req, res) => {
     if (!page) throw new Error('No Facebook Page found for this account');
 
     // 4. Subscribe the app to this Page's webhooks
-    await fetch(`https://graph.facebook.com/v19.0/${page.id}/subscribed_apps`, {
+    const subRes = await fetch(`https://graph.facebook.com/v19.0/${page.id}/subscribed_apps`, {
       method: 'POST',
       body: new URLSearchParams({
         subscribed_fields: 'messages,messaging_postbacks',
         access_token: page.access_token,
       }),
     });
+    const subData = await subRes.json();
+    console.log('[Facebook] Page webhook subscribe result:', JSON.stringify(subData));
+    if (!subData.success) {
+      console.error('[Facebook] Page did NOT subscribe to webhooks — messages will not be delivered:', subData);
+    }
 
     // 5. Save to DB
     if (state) {
@@ -1047,21 +1052,34 @@ app.get('/api/facebook/tickets', authenticateToken, async (req, res) => {
 // POST — agent sends reply via Send API, marks ticket resolved (authenticated)
 app.post('/api/facebook/reply', authenticateToken, async (req, res) => {
   try {
-    const { ticketId, threadId, body } = req.body;
+    const { ticketId, threadId, body, isStatusUpdate } = req.body;
     if (!threadId || !body?.trim()) return res.status(400).json({ error: 'threadId and body required' });
 
     const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
     if (!user?.facebookPageToken) return res.status(400).json({ error: 'Facebook not connected' });
+
+    // Standard replies use the normal message object (works within the 24h window).
+    // Status updates (e.g. "your refund has been processed") are non-promotional
+    // account/order updates that may be sent outside that window using a message
+    // tag, per Meta's utility messaging policy (pages_utility_messaging).
+    const messagePayload = isStatusUpdate
+      ? {
+          recipient: { id: threadId },
+          messaging_type: 'MESSAGE_TAG',
+          tag: 'POST_PURCHASE_UPDATE',
+          message: { text: body },
+        }
+      : {
+          recipient: { id: threadId },
+          message: { text: body },
+        };
 
     const sendRes = await fetch(
       `https://graph.facebook.com/v19.0/me/messages?access_token=${user.facebookPageToken}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          recipient: { id: threadId },
-          message: { text: body },
-        }),
+        body: JSON.stringify(messagePayload),
       }
     );
     if (!sendRes.ok) {
