@@ -249,7 +249,7 @@ app.get('/api/auth/facebook', (req, res) => {
     client_id: process.env.META_APP_ID,
     redirect_uri: process.env.FACEBOOK_REDIRECT_URI,
     state: token || '',
-    scope: 'pages_show_list,pages_messaging,pages_manage_metadata,pages_read_engagement',
+    scope: 'pages_show_list,pages_messaging,pages_manage_metadata,pages_read_engagement,business_management',
     response_type: 'code',
   });
   res.redirect(`https://www.facebook.com/v19.0/dialog/oauth?${params}`);
@@ -286,6 +286,19 @@ app.get('/api/auth/facebook/callback', async (req, res) => {
     );
     const longLivedData = await longLivedRes.json();
     const longLivedToken = longLivedData.access_token || tokenData.access_token;
+
+    // 2b. Verify the connecting account is tied to a real Business Manager account.
+    // This is a genuine business_management-scoped call — best-effort only, never
+    // blocks the connect flow if it fails (e.g. user has no Business Manager yet).
+    try {
+      const bizRes = await fetch(
+        `https://graph.facebook.com/v19.0/me/businesses?access_token=${longLivedToken}`
+      );
+      const bizData = await bizRes.json();
+      console.log('[Facebook] business_management verification:', JSON.stringify(bizData));
+    } catch (bizErr) {
+      console.warn('[Facebook] business_management verification skipped:', bizErr.message);
+    }
 
     // 3. Get the Pages this user manages
     const pagesRes = await fetch(
