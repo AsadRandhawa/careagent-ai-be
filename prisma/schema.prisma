@@ -28,6 +28,12 @@ model User {
   facebookConnected     Boolean        @default(false)
   facebookEnabled       Boolean        @default(true)
 
+  // Instagram DMs (via linked Facebook Page)
+  instagramBusinessId   String?
+  instagramUsername     String?
+  instagramConnected    Boolean        @default(false)
+  instagramEnabled      Boolean        @default(true)
+
   tickets               Ticket[]
   documentChunks        DocumentChunk[]
   chatSessions          ChatSession[]
