@@ -1688,6 +1688,166 @@ app.delete('/api/user/disconnect/instagram', authenticateToken, async (req, res)
 });
 
 // ═══════════════════════════════════════════════════════════
+// WHATSAPP — single-tenant integration (your own WhatsApp Business number)
+// ═══════════════════════════════════════════════════════════
+// This is deliberately NOT the same design as Facebook/Instagram, which
+// let any of your customers connect their own Page. WhatsApp here uses one
+// shared set of credentials from env vars (WHATSAPP_ACCESS_TOKEN,
+// WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_VERIFY_TOKEN) — your own number only.
+// Every incoming message gets attached to whichever account WHATSAPP_OWNER_USER_ID
+// points at. There was a fuller per-customer version drafted in the dead
+// controllers/routes/services scaffold (whatsapp_service.js), but it was
+// incomplete in ways that matter: incoming messages were parsed and then
+// never actually saved (a literal `// TODO: persist tickets` with the save
+// call commented out), there was no lookup from an incoming message back to
+// which CareAgent user owns it, the webhook signature check failed OPEN
+// when no secret was configured (`if (!secret) return true`), and the
+// Embedded Signup token exchange only fetched a short-lived token with no
+// refresh, which would have silently broken a few hours after connecting.
+// Building the real multi-tenant version (customers connecting their own
+// WhatsApp numbers via Embedded Signup) is future work once Meta's Tech
+// Provider approval is in place — this gets your own number working now.
+
+// GET — Meta's webhook verification challenge
+app.get('/api/whatsapp/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const verifyToken = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && verifyToken === process.env.WHATSAPP_VERIFY_TOKEN) {
+    console.log('[WhatsApp] Webhook verified ✅');
+    return res.status(200).send(challenge);
+  }
+  res.sendStatus(403);
+});
+
+// POST — incoming WhatsApp messages (public, signature-checked)
+// WhatsApp webhooks are signed the same way as Messenger/Instagram — same
+// Meta App Secret, same X-Hub-Signature-256 header — so this reuses the
+// same fail-closed helper rather than a separate, easier-to-drift copy.
+app.post('/api/whatsapp/webhook', async (req, res) => {
+  res.sendStatus(200); // ack immediately — Meta retries aggressively on non-200
+
+  try {
+    if (!isValidMetaSignature(req)) {
+      console.warn('[WhatsApp] Dropping unverified webhook payload.');
+      return;
+    }
+
+    const ownerUserId = process.env.WHATSAPP_OWNER_USER_ID;
+    if (!ownerUserId) {
+      console.error('[WhatsApp] WHATSAPP_OWNER_USER_ID is not configured — dropping message. Set this env var to the id of the User row that should own incoming WhatsApp tickets.');
+      return;
+    }
+    const user = await prisma.user.findUnique({ where: { id: ownerUserId } });
+    if (!user) {
+      console.error('[WhatsApp] WHATSAPP_OWNER_USER_ID does not match a real user — dropping message.');
+      return;
+    }
+
+    for (const entry of req.body.entry || []) {
+      for (const change of entry.changes || []) {
+        const value = change.value;
+        const messages = value?.messages || [];
+        const contacts = value?.contacts || [];
+
+        for (const msg of messages) {
+          const contact = contacts.find(c => c.wa_id === msg.from) || {};
+          const customerName = contact.profile?.name || msg.from;
+
+          await prisma.ticket.upsert({
+            where: { userId_externalId: { userId: user.id, externalId: msg.id } },
+            update: {},
+            create: {
+              userId: user.id,
+              externalId: msg.id,
+              threadId: msg.from, // customer's WhatsApp number — used to route replies
+              customerName,
+              customerEmail: null,
+              phoneNumber: msg.from,
+              subject: 'WhatsApp message',
+              content: extractWhatsAppMessageText(msg),
+              channel: 'whatsapp',
+              status: 'new',
+              sentiment: 'Neutral',
+              category: 'General',
+              receivedAt: new Date(Number(msg.timestamp) * 1000),
+            },
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[WhatsApp] Webhook processing error:', err.message);
+  }
+});
+
+function extractWhatsAppMessageText(msg) {
+  switch (msg.type) {
+    case 'text':     return msg.text?.body || '';
+    case 'image':    return '[Image received]';
+    case 'audio':    return '[Voice message received]';
+    case 'video':    return '[Video received]';
+    case 'document': return `[Document: ${msg.document?.filename || 'file'}]`;
+    case 'location': return `[Location: ${msg.location?.latitude}, ${msg.location?.longitude}]`;
+    default:          return `[${msg.type} message]`;
+  }
+}
+
+// GET — WhatsApp tickets from DB (authenticated)
+app.get('/api/whatsapp/tickets', authenticateToken, async (req, res) => {
+  try {
+    const tickets = await prisma.ticket.findMany({
+      where: { userId: req.user.userId, channel: 'whatsapp' },
+      orderBy: { receivedAt: 'desc' },
+    });
+    res.json(tickets);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch WhatsApp tickets.' });
+  }
+});
+
+// POST — send a WhatsApp reply (authenticated, idempotency-protected —
+// same protection as the other three send-a-real-message endpoints)
+app.post('/api/whatsapp/reply', authenticateToken, requireIdempotencyKey, async (req, res) => {
+  try {
+    const { ticketId, message } = req.body;
+    if (!process.env.WHATSAPP_ACCESS_TOKEN || !process.env.WHATSAPP_PHONE_NUMBER_ID) {
+      return res.status(400).json({ error: 'WhatsApp is not configured on this server.' });
+    }
+    const ticket = await prisma.ticket.findFirst({ where: { id: ticketId, userId: req.user.userId, channel: 'whatsapp' } });
+    if (!ticket?.threadId) return res.status(404).json({ error: 'WhatsApp ticket not found.' });
+
+    const waRes = await fetch(
+      `https://graph.facebook.com/v19.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messaging_product: 'whatsapp',
+          to: ticket.threadId,
+          type: 'text',
+          text: { body: message },
+        }),
+      }
+    );
+    if (!waRes.ok) {
+      const errBody = await waRes.json().catch(() => ({}));
+      console.error('[WhatsApp] Send failed:', errBody);
+      return res.status(502).json({ error: errBody?.error?.message || 'Failed to send WhatsApp message.' });
+    }
+
+    await prisma.ticket.update({ where: { id: ticket.id }, data: { status: 'resolved', resolvedAt: new Date() } });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[WhatsApp] Reply error:', err.message);
+    res.status(500).json({ error: 'Failed to send WhatsApp reply.' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
 // LIVE CHAT — Widget + Real-time Chat Routes
 // ═══════════════════════════════════════════════════════════
 
