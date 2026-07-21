@@ -39,6 +39,16 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const ACCESS_TOKEN_TTL = '30d'; // pragmatic default until refresh-token rotation ships — see audit notes
 
 const app = express();
+// Railway (like Heroku/Render/any platform behind a load balancer) puts this
+// app behind a reverse proxy that sets X-Forwarded-For to the real visitor
+// IP. Express doesn't trust that header by default — for good reason, since
+// blindly trusting it would let a client fake any IP it wants and dodge
+// express-rate-limit entirely. `1` means "trust exactly one hop" (Railway's
+// edge proxy), which is the correct, narrow setting for this deployment
+// topology — not `true`, which would trust the header no matter how many
+// proxies forwarded it, reopening the same spoofing risk this is meant to
+// close.
+app.set('trust proxy', 1);
 app.use(helmet({
   // This is a JSON API + a publicly-embeddable widget script, not an HTML app —
   // a strict default CSP has no HTML surface to protect here and would only
