@@ -567,12 +567,20 @@ app.post('/api/tickets/dismiss', authenticateToken, async (req, res) => {
 // who discovered the URL could POST a fake `transaction.completed` event
 // with an arbitrary email and grant that account a free paid plan. That is
 // a direct billing-fraud vulnerability, not a hardening nice-to-have.
+//
+// Uses req.rawBody (captured by the global express.json() verify hook) —
+// NOT req.body. The route previously had its own express.raw() middleware,
+// but the global JSON parser (registered earlier, applies to every route)
+// always consumes the body first, so that route-level raw() never actually
+// saw the real bytes — req.body was already a parsed object by the time it
+// ran. This is the same root cause that made every Paddle delivery in your
+// notification log fail, going back well before any of these changes.
 function isValidPaddleSignature(req) {
   const secret = process.env.PADDLE_WEBHOOK_SECRET;
   const header = req.headers['paddle-signature'];
-  if (!secret || !header) {
-    console.warn('[Paddle webhook] Rejecting — missing secret or signature header', {
-      hasSecret: !!secret, hasHeader: !!header,
+  if (!secret || !header || !req.rawBody) {
+    console.warn('[Paddle webhook] Rejecting — missing secret, signature header, or raw body', {
+      hasSecret: !!secret, hasHeader: !!header, hasRawBody: !!req.rawBody,
     });
     return false;
   }
@@ -590,7 +598,7 @@ function isValidPaddleSignature(req) {
     console.warn('[Paddle webhook] Rejecting — signature timestamp outside tolerance window');
     return false;
   }
-  const signedPayload = `${ts}:${req.body.toString()}`;
+  const signedPayload = `${ts}:${req.rawBody.toString()}`;
   const expected = crypto.createHmac('sha256', secret).update(signedPayload).digest('hex');
   const sigBuf = Buffer.from(h1);
   const expBuf = Buffer.from(expected);
@@ -602,12 +610,15 @@ function isValidPaddleSignature(req) {
 }
 
 // ── Paddle Webhook ───────────────────────────────────────
-app.post('/api/paddle/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+// See note above — no express.raw() here; the global JSON parser already
+// parsed the body into req.body correctly, and captured the raw bytes into
+// req.rawBody for signature verification. No need to JSON.parse again.
+app.post('/api/paddle/webhook', async (req, res) => {
   try {
     if (!isValidPaddleSignature(req)) {
       return res.status(401).json({ error: 'Invalid signature' });
     }
-    const payload = JSON.parse(req.body.toString());
+    const payload = req.body;
     const eventType = payload.event_type;
 
     if (eventType === 'transaction.completed' || eventType === 'subscription.activated') {
@@ -1173,12 +1184,22 @@ app.post('/api/stripe/create-checkout', authenticateToken, async (req, res) => {
 });
 
 // Stripe Webhook — handle payment events
-app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+// NOTE: this route intentionally does NOT use express.raw() as middleware —
+// the global app.use(express.json({ verify: ... })) above already consumes
+// the request body for every route (including this one) before any
+// route-specific middleware runs, so a route-level express.raw() here would
+// receive an already-drained stream and never see the real bytes. That was
+// the case in the original code too, which meant `req.body` passed to
+// stripe.webhooks.constructEvent() was a parsed JS object, not the raw
+// string/Buffer the Stripe SDK requires — so signature verification could
+// never have succeeded. Using req.rawBody (captured by the global parser's
+// verify hook) is the fix.
+app.post('/api/stripe/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
 
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET || '');
+    event = stripe.webhooks.constructEvent(req.rawBody, sig, process.env.STRIPE_WEBHOOK_SECRET || '');
   } catch (err) {
     console.error('Webhook signature error:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
