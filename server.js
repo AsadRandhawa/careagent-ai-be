@@ -204,7 +204,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
     const user = await prisma.user.findUnique({
       where: { id: req.user.userId },
       select: {
-        id: true, email: true, documents: true,
+        id: true, email: true, documents: true, plan: true,
         businessIdentity: true, brandVoice: true,
         googleTokens: true, gmailEnabled: true,
         aiAutoDrafting: true, autoClassification: true, sentimentTracking: true,
@@ -217,6 +217,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
     res.json({
       id: user.id,
       email: user.email,
+      plan: user.plan ?? 'startup',
       googleConnected:    !!user.googleTokens,
       facebookConnected:  user.facebookConnected  ?? false,
       facebookPageName:   user.facebookPageName    ?? null,
