@@ -75,7 +75,7 @@ app.use(express.json({
 // in-memory store for a Redis store so limits are shared across instances.
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  limit: 10,                 // 10 attempts per window per IP
+  limit: 20,                 // 20 attempts per window per IP
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many attempts. Please try again later.' },
@@ -97,6 +97,73 @@ const authenticateToken = (req, res, next) => {
     req.user = user;
     next();
   });
+};
+
+// ── Idempotency middleware ──────────────────────────────────
+// Guards endpoints that cause a real, external, non-repeatable side effect
+// (sending a message to a real customer via Gmail/Messenger/Instagram/live
+// chat). Without this, a flaky connection causing the frontend to retry a
+// "send reply" POST — or a double-click before a button disables — sends
+// the same message to the customer twice, with no way for either side to
+// know it happened.
+//
+// The client must send an `Idempotency-Key` header (any client-generated
+// unique string, e.g. crypto.randomUUID()) with every send request. The
+// first request with a given key actually runs the handler and its
+// response is cached; any repeat of that same key — same user, same route,
+// same key — within the TTL window replays the cached response instead of
+// re-executing the handler, so the external send never happens twice.
+//
+// STORAGE: in-memory, scoped to this single Node process. That matches
+// where this app actually runs today (one Railway instance, no horizontal
+// scaling — see the production-readiness audit's scalability section). If
+// this ever runs multiple instances, this needs to move to Redis/DB-backed
+// storage, since two instances wouldn't share this Map and a retry routed
+// to a different instance would bypass the guard entirely. Documented here
+// rather than silently assumed.
+const IDEMPOTENCY_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const idempotencyStore = new Map(); // key -> { status, body, expiresAt }
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of idempotencyStore) {
+    if (entry.expiresAt < now) idempotencyStore.delete(key);
+  }
+}, 60 * 1000).unref(); // unref so this timer never keeps the process alive on its own (relevant for clean test-process exit)
+
+const requireIdempotencyKey = (req, res, next) => {
+  const idempotencyKey = req.headers['idempotency-key'];
+  if (!idempotencyKey || typeof idempotencyKey !== 'string' || idempotencyKey.length < 8) {
+    return res.status(400).json({
+      error: 'Missing or invalid Idempotency-Key header. Generate a unique key per send action (e.g. crypto.randomUUID()) and reuse the same key if retrying the same request.'
+    });
+  }
+  const storeKey = `${req.user.userId}:${req.path}:${idempotencyKey}`;
+  const cached = idempotencyStore.get(storeKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    res.setHeader('Idempotency-Replayed', 'true');
+    return res.status(cached.status).json(cached.body);
+  }
+
+  // Wrap res.json so whatever the real handler sends gets captured and
+  // cached against this key, without every route having to remember to
+  // do this itself.
+  const originalJson = res.json.bind(res);
+  res.json = (body) => {
+    // Only cache genuine outcomes, not errors from further up the stack
+    // (e.g. auth failures) — those aren't idempotency-relevant and
+    // shouldn't block a legitimate retry once the underlying issue (auth,
+    // bad input) is fixed.
+    if (res.statusCode < 500) {
+      idempotencyStore.set(storeKey, {
+        status: res.statusCode,
+        body,
+        expiresAt: Date.now() + IDEMPOTENCY_TTL_MS,
+      });
+    }
+    return originalJson(body);
+  };
+  next();
 };
 
 // ── Google OAuth ───────────────────────────────────────────
@@ -366,7 +433,13 @@ app.get('/api/auth/facebook', (req, res) => {
     client_id: process.env.META_APP_ID,
     redirect_uri: process.env.FACEBOOK_REDIRECT_URI,
     state: token || '',
-    scope: 'pages_show_list,pages_messaging,pages_manage_metadata,pages_read_engagement,business_management,instagram_basic,instagram_manage_messages',
+    // Meta retired `instagram_basic` and `instagram_manage_messages` in
+    // favor of `instagram_business_*` names as part of migrating Instagram
+    // messaging onto the newer Instagram Business API — the old names now
+    // fail with "Invalid Scopes" at the OAuth dialog. This is the current,
+    // correct set for reading page/Instagram info and sending/receiving
+    // Instagram DMs via a connected Facebook Page.
+    scope: 'pages_show_list,pages_messaging,pages_manage_metadata,pages_read_engagement,business_management,instagram_business_basic,instagram_business_manage_messages',
     response_type: 'code',
   });
   res.redirect(`https://www.facebook.com/v19.0/dialog/oauth?${params}`);
@@ -688,7 +761,7 @@ app.post('/api/tickets/escalate', authenticateToken, async (req, res) => {
 });
 
 // Send reply and mark ticket as resolved
-app.post('/api/gmail/reply', authenticateToken, async (req, res) => {
+app.post('/api/gmail/reply', authenticateToken, requireIdempotencyKey, async (req, res) => {
   try {
     const { to, subject, body, threadId, ticketExternalId } = req.body;
     const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
@@ -1417,7 +1490,7 @@ app.get('/api/facebook/tickets', authenticateToken, async (req, res) => {
 });
 
 // POST — agent sends reply via Send API, marks ticket resolved (authenticated)
-app.post('/api/facebook/reply', authenticateToken, async (req, res) => {
+app.post('/api/facebook/reply', authenticateToken, requireIdempotencyKey, async (req, res) => {
   try {
     const { ticketId, threadId, body } = req.body;
     if (!threadId || !body?.trim()) return res.status(400).json({ error: 'threadId and body required' });
@@ -1561,7 +1634,7 @@ app.get('/api/instagram/tickets', authenticateToken, async (req, res) => {
 });
 
 // POST — agent sends reply via Instagram Send API (authenticated)
-app.post('/api/instagram/reply', authenticateToken, async (req, res) => {
+app.post('/api/instagram/reply', authenticateToken, requireIdempotencyKey, async (req, res) => {
   try {
     const { ticketId, threadId, body } = req.body;
     if (!threadId || !body?.trim()) return res.status(400).json({ error: 'threadId and body required' });
@@ -1792,7 +1865,7 @@ app.get('/api/livechat/messages/:sessionId', authenticateToken, async (req, res)
 });
 
 // POST /api/livechat/reply — agent sends reply (authenticated)
-app.post('/api/livechat/reply', authenticateToken, async (req, res) => {
+app.post('/api/livechat/reply', authenticateToken, requireIdempotencyKey, async (req, res) => {
   try {
     const { sessionId, content } = req.body;
     if (!sessionId || !content?.trim()) return res.status(400).json({ error: 'sessionId and content required' });
@@ -1823,6 +1896,15 @@ app.post('/api/livechat/resolve', authenticateToken, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+// Only actually bind to a port when this file is run directly (Railway's
+// `node server.js`) — not when it's imported, e.g. by the test suite via
+// supertest, which needs the configured `app` without a real listener
+// fighting over a port across test files.
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
+
+export default app;
+export { isValidMetaSignature, isValidPaddleSignature };
