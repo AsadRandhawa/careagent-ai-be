@@ -292,6 +292,16 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
       instagramConnected: user.instagramConnected ?? false,
       instagramUsername:  user.instagramUsername   ?? null,
       instagramEnabled:   user.instagramEnabled    ?? true,
+      // WhatsApp is single-tenant right now (see server.js's WhatsApp
+      // section) — there's no per-user connect flow yet, so "connected"
+      // just reflects whether this specific account is the configured
+      // WHATSAPP_OWNER_USER_ID and the required credentials are actually
+      // set, not something the user did by clicking a button.
+      whatsappConnected: !!(
+        process.env.WHATSAPP_ACCESS_TOKEN &&
+        process.env.WHATSAPP_PHONE_NUMBER_ID &&
+        process.env.WHATSAPP_OWNER_USER_ID === user.id
+      ),
       gmailEnabled:       user.gmailEnabled       ?? true,
       aiAutoDrafting:     user.aiAutoDrafting     ?? true,
       autoClassification: user.autoClassification ?? true,
