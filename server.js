@@ -443,13 +443,16 @@ app.get('/api/auth/facebook', (req, res) => {
     client_id: process.env.META_APP_ID,
     redirect_uri: process.env.FACEBOOK_REDIRECT_URI,
     state: token || '',
-    // Meta retired `instagram_basic` and `instagram_manage_messages` in
-    // favor of `instagram_business_*` names as part of migrating Instagram
-    // messaging onto the newer Instagram Business API — the old names now
-    // fail with "Invalid Scopes" at the OAuth dialog. This is the current,
-    // correct set for reading page/Instagram info and sending/receiving
-    // Instagram DMs via a connected Facebook Page.
-    scope: 'pages_show_list,pages_messaging,pages_manage_metadata,pages_read_engagement,business_management,instagram_business_basic,instagram_business_manage_messages',
+    // Confirmed against this specific app's dashboard (Use cases → Messenger
+    // from Meta → Permissions and features): instagram_basic and
+    // instagram_manage_messages are the ones actually added to this app and
+    // showing "Ready for testing" — NOT instagram_business_basic /
+    // instagram_business_manage_messages. Those newer names are real, but
+    // they belong to a different integration path (standalone "Instagram
+    // Login") than the Page-linked Messenger flow this app uses. Confirmed
+    // by testing, not assumed — don't switch this back without re-checking
+    // the dashboard first.
+    scope: 'pages_show_list,pages_messaging,pages_manage_metadata,pages_read_engagement,business_management,instagram_basic,instagram_manage_messages',
     response_type: 'code',
   });
   res.redirect(`https://www.facebook.com/v19.0/dialog/oauth?${params}`);
