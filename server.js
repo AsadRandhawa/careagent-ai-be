@@ -629,7 +629,7 @@ app.get('/api/gmail/emails', authenticateToken, async (req, res) => {
         createdAt,
         status:       (dbTicket?.status === 'resolved') ? 'resolved' : (dbTicket?.status === 'escalated') ? 'escalated' : 'new',
         hasDraft:     true,
-        avatarVariant: ['blue', 'purple', 'green', 'orange'][Math.floor(Math.random() * 4)],
+        avatarVariant: pickAvatarVariant(customerName || emailAddress),
         email:        emailAddress,
         category:     dbTicket?.category || 'General',
         content:      email.data.snippet,
@@ -1812,6 +1812,23 @@ app.post('/api/whatsapp/webhook', async (req, res) => {
   }
 });
 
+// Deterministically picks an avatar color for a given seed (customer name,
+// email, phone number — anything stable for that customer). Replaces the
+// original `Math.floor(Math.random() * 4)` pattern used in the Gmail sync
+// route, which reassigned a random color to the same customer on every
+// single fetch — flagged early in the production-readiness review as a
+// visible, easily-noticed bug (a customer's avatar color would change
+// every time the inbox refreshed) and left unfixed until now.
+const AVATAR_VARIANTS = ['blue', 'purple', 'green', 'teal', 'warn', 'danger'];
+function pickAvatarVariant(seed) {
+  const s = String(seed || '');
+  let hash = 0;
+  for (let i = 0; i < s.length; i++) {
+    hash = (hash * 31 + s.charCodeAt(i)) | 0;
+  }
+  return AVATAR_VARIANTS[Math.abs(hash) % AVATAR_VARIANTS.length];
+}
+
 function extractWhatsAppMessageText(msg) {
   switch (msg.type) {
     case 'text':     return msg.text?.body || '';
@@ -1831,7 +1848,32 @@ app.get('/api/whatsapp/tickets', authenticateToken, async (req, res) => {
       where: { userId: req.user.userId, channel: 'whatsapp' },
       orderBy: { receivedAt: 'desc' },
     });
-    res.json(tickets);
+    // NOTE: this previously returned raw DB rows with no field mapping at
+    // all — every other channel's GET endpoint (Facebook, Instagram,
+    // Gmail, livechat) computes `initials`/`avatarVariant`/`time`/
+    // `hasDraft` before sending tickets to the frontend, since the
+    // frontend's Avatar component has no fallback for a missing
+    // `initials` prop and crashes the entire page render when it's
+    // undefined. This gap only stayed hidden because real WhatsApp
+    // tickets were rarely rendered before the channel was actually wired
+    // up end-to-end — worth remembering that "no crash reports yet"
+    // isn't the same as "this path is exercised and correct."
+    res.json(tickets.map(t => ({
+      id: t.id,
+      threadId: t.threadId,
+      customerName: t.customerName,
+      initials: (t.customerName || 'U').substring(0, 2).toUpperCase(),
+      subject: t.subject || 'WhatsApp message',
+      content: t.content,
+      time: new Date(t.receivedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      createdAt: t.receivedAt.toISOString(),
+      status: t.status,
+      hasDraft: true,
+      avatarVariant: pickAvatarVariant(t.customerName || t.phoneNumber),
+      channel: 'whatsapp',
+      category: t.category,
+      sentiment: t.sentiment,
+    })));
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch WhatsApp tickets.' });
   }
