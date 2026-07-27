@@ -278,6 +278,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
         lastSeenInboxAt: true, lastSeenEscalAt: true,
         facebookConnected: true, facebookPageName: true, facebookEnabled: true,
         instagramConnected: true, instagramUsername: true, instagramEnabled: true,
+        whatsappToken: true, whatsappPhoneNumberId: true, whatsappWabaId: true,
       }
     });
     res.set('Cache-Control', 'no-store');
@@ -292,15 +293,15 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
       instagramConnected: user.instagramConnected ?? false,
       instagramUsername:  user.instagramUsername   ?? null,
       instagramEnabled:   user.instagramEnabled    ?? true,
-      // WhatsApp is single-tenant right now (see server.js's WhatsApp
-      // section) — there's no per-user connect flow yet, so "connected"
-      // just reflects whether this specific account is the configured
-      // WHATSAPP_OWNER_USER_ID and the required credentials are actually
-      // set, not something the user did by clicking a button.
+      // WhatsApp is "connected" for this account if either: (a) they went
+      // through Embedded Signup and have their own token/number stored, or
+      // (b) they're the single-tenant fallback account configured via env
+      // vars (the original test setup, kept working for backward compat).
       whatsappConnected: !!(
-        process.env.WHATSAPP_ACCESS_TOKEN &&
-        process.env.WHATSAPP_PHONE_NUMBER_ID &&
-        process.env.WHATSAPP_OWNER_USER_ID === user.id
+        (user.whatsappToken && user.whatsappPhoneNumberId) ||
+        (process.env.WHATSAPP_ACCESS_TOKEN &&
+         process.env.WHATSAPP_PHONE_NUMBER_ID &&
+         process.env.WHATSAPP_OWNER_USER_ID === user.id)
       ),
       gmailEnabled:       user.gmailEnabled       ?? true,
       aiAutoDrafting:     user.aiAutoDrafting     ?? true,
@@ -1701,25 +1702,29 @@ app.delete('/api/user/disconnect/instagram', authenticateToken, async (req, res)
 });
 
 // ═══════════════════════════════════════════════════════════
-// WHATSAPP — single-tenant integration (your own WhatsApp Business number)
-// ═══════════════════════════════════════════════════════════
-// This is deliberately NOT the same design as Facebook/Instagram, which
-// let any of your customers connect their own Page. WhatsApp here uses one
-// shared set of credentials from env vars (WHATSAPP_ACCESS_TOKEN,
-// WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_VERIFY_TOKEN) — your own number only.
-// Every incoming message gets attached to whichever account WHATSAPP_OWNER_USER_ID
-// points at. There was a fuller per-customer version drafted in the dead
-// controllers/routes/services scaffold (whatsapp_service.js), but it was
-// incomplete in ways that matter: incoming messages were parsed and then
-// never actually saved (a literal `// TODO: persist tickets` with the save
-// call commented out), there was no lookup from an incoming message back to
-// which CareAgent user owns it, the webhook signature check failed OPEN
-// when no secret was configured (`if (!secret) return true`), and the
-// Embedded Signup token exchange only fetched a short-lived token with no
-// refresh, which would have silently broken a few hours after connecting.
-// Building the real multi-tenant version (customers connecting their own
-// WhatsApp numbers via Embedded Signup) is future work once Meta's Tech
-// Provider approval is in place — this gets your own number working now.
+// WHATSAPP — now supports both single-tenant (env vars, your own
+// number) AND real multi-tenant (customers connect their own number via
+// Embedded Signup, stored per-user in the DB). Both paths are live
+// simultaneously: the webhook and reply handlers check the DB first for a
+// matching per-user connection, and fall back to the env-var single-tenant
+// setup if no DB match is found — so your existing test number keeps
+// working exactly as before, with no migration needed.
+//
+// IMPORTANT — this is built, but not yet usable by real, unrelated
+// customers: Meta requires "Tech Provider" status (its own App Review
+// track, separate from the one already in flight for Instagram/Messenger)
+// before whatsapp_business_management can access WABAs your business
+// doesn't own. Until that clears, this flow will only work for accounts
+// with an app role (same Development Mode restriction we hit with
+// Instagram) — worth testing with your own or a tester's WhatsApp Business
+// account, not yet ready to put in front of real external customers.
+//
+// The token exchange here does the long-lived (60-day) token exchange
+// that was missing from the original scaffold — but a 60-day token still
+// expires. A proper production version would provision a permanent
+// System User token per customer instead (a further Business Manager API
+// step not built here) or add a scheduled refresh job before this ships
+// to real customers. Flagged here rather than silently glossed over.
 
 // GET — Meta's webhook verification challenge
 app.get('/api/whatsapp/webhook', (req, res) => {
@@ -1732,6 +1737,22 @@ app.get('/api/whatsapp/webhook', (req, res) => {
   }
   res.sendStatus(403);
 });
+
+// Finds which CareAgent user owns an incoming WhatsApp message, given the
+// phone_number_id Meta reports it arrived on. Checks real per-user
+// connections (Embedded Signup) first, then falls back to the single
+// global env-var-configured number for backward compatibility.
+async function findWhatsAppOwner(phoneNumberId) {
+  if (!phoneNumberId) return null;
+
+  const dbOwner = await prisma.user.findFirst({ where: { whatsappPhoneNumberId: phoneNumberId } });
+  if (dbOwner) return dbOwner;
+
+  if (phoneNumberId === process.env.WHATSAPP_PHONE_NUMBER_ID && process.env.WHATSAPP_OWNER_USER_ID) {
+    return prisma.user.findUnique({ where: { id: process.env.WHATSAPP_OWNER_USER_ID } });
+  }
+  return null;
+}
 
 // POST — incoming WhatsApp messages (public, signature-checked)
 // WhatsApp webhooks are signed the same way as Messenger/Instagram — same
@@ -1746,22 +1767,19 @@ app.post('/api/whatsapp/webhook', async (req, res) => {
       return;
     }
 
-    const ownerUserId = process.env.WHATSAPP_OWNER_USER_ID;
-    if (!ownerUserId) {
-      console.error('[WhatsApp] WHATSAPP_OWNER_USER_ID is not configured — dropping message. Set this env var to the id of the User row that should own incoming WhatsApp tickets.');
-      return;
-    }
-    const user = await prisma.user.findUnique({ where: { id: ownerUserId } });
-    if (!user) {
-      console.error('[WhatsApp] WHATSAPP_OWNER_USER_ID does not match a real user — dropping message.');
-      return;
-    }
-
     for (const entry of req.body.entry || []) {
       for (const change of entry.changes || []) {
         const value = change.value;
+        const phoneNumberId = value?.metadata?.phone_number_id;
         const messages = value?.messages || [];
         const contacts = value?.contacts || [];
+        if (messages.length === 0) continue;
+
+        const user = await findWhatsAppOwner(phoneNumberId);
+        if (!user) {
+          console.error(`[WhatsApp] No CareAgent user is connected to phone_number_id ${phoneNumberId} — dropping ${messages.length} message(s).`);
+          continue;
+        }
 
         for (const msg of messages) {
           const contact = contacts.find(c => c.wa_id === msg.from) || {};
@@ -1820,22 +1838,29 @@ app.get('/api/whatsapp/tickets', authenticateToken, async (req, res) => {
 });
 
 // POST — send a WhatsApp reply (authenticated, idempotency-protected —
-// same protection as the other three send-a-real-message endpoints)
+// same protection as the other three send-a-real-message endpoints).
+// Uses the ticket-owning user's own connected number if they have one
+// (real multi-tenant), otherwise falls back to the global env-var number.
 app.post('/api/whatsapp/reply', authenticateToken, requireIdempotencyKey, async (req, res) => {
   try {
     const { ticketId, message } = req.body;
-    if (!process.env.WHATSAPP_ACCESS_TOKEN || !process.env.WHATSAPP_PHONE_NUMBER_ID) {
-      return res.status(400).json({ error: 'WhatsApp is not configured on this server.' });
-    }
     const ticket = await prisma.ticket.findFirst({ where: { id: ticketId, userId: req.user.userId, channel: 'whatsapp' } });
     if (!ticket?.threadId) return res.status(404).json({ error: 'WhatsApp ticket not found.' });
 
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
+    const accessToken   = user?.whatsappToken || process.env.WHATSAPP_ACCESS_TOKEN;
+    const phoneNumberId = user?.whatsappPhoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID;
+
+    if (!accessToken || !phoneNumberId) {
+      return res.status(400).json({ error: 'WhatsApp is not connected for this account.' });
+    }
+
     const waRes = await fetch(
-      `https://graph.facebook.com/v19.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
+      `https://graph.facebook.com/v19.0/${phoneNumberId}/messages`,
       {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
+          'Authorization': `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
@@ -1857,6 +1882,87 @@ app.post('/api/whatsapp/reply', authenticateToken, requireIdempotencyKey, async 
   } catch (err) {
     console.error('[WhatsApp] Reply error:', err.message);
     res.status(500).json({ error: 'Failed to send WhatsApp reply.' });
+  }
+});
+
+// POST — Embedded Signup callback (authenticated). The frontend's FB SDK
+// popup flow hands back an authorization `code`, plus the wabaId and
+// phoneNumberId it captures separately from Meta's WA_EMBEDDED_SIGNUP
+// postMessage event (Meta doesn't return those two in the code exchange
+// itself — the frontend listens for them during the popup flow and sends
+// them here alongside the code).
+app.post('/api/whatsapp/connect', authenticateToken, async (req, res) => {
+  try {
+    const { code, wabaId, phoneNumberId } = req.body;
+    if (!code || !wabaId || !phoneNumberId) {
+      return res.status(400).json({ error: 'Missing code, wabaId, or phoneNumberId from the signup flow.' });
+    }
+
+    // Step 1: exchange the authorization code for a short-lived token.
+    const shortLivedRes = await fetch(
+      `https://graph.facebook.com/v19.0/oauth/access_token?client_id=${process.env.META_APP_ID}&client_secret=${process.env.META_APP_SECRET}&code=${encodeURIComponent(code)}`
+    );
+    const shortLivedData = await shortLivedRes.json();
+    if (!shortLivedRes.ok || !shortLivedData.access_token) {
+      console.error('[WhatsApp] Code exchange failed:', shortLivedData);
+      return res.status(400).json({ error: 'Failed to exchange authorization code with Meta.' });
+    }
+
+    // Step 2: exchange the short-lived token for a long-lived one (60
+    // days). This is the step the original scaffold skipped entirely,
+    // which would have made every connection silently stop working a
+    // couple hours after setup.
+    const longLivedRes = await fetch(
+      `https://graph.facebook.com/v19.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${process.env.META_APP_ID}&client_secret=${process.env.META_APP_SECRET}&fb_exchange_token=${shortLivedData.access_token}`
+    );
+    const longLivedData = await longLivedRes.json();
+    if (!longLivedRes.ok || !longLivedData.access_token) {
+      console.error('[WhatsApp] Long-lived token exchange failed:', longLivedData);
+      return res.status(400).json({ error: 'Failed to obtain a long-lived access token.' });
+    }
+
+    // Step 3: subscribe this app to the customer's WABA — without this,
+    // Meta has no reason to ever call your webhook for this number's
+    // messages, even with everything else configured correctly.
+    const subscribeRes = await fetch(
+      `https://graph.facebook.com/v19.0/${wabaId}/subscribed_apps`,
+      { method: 'POST', headers: { 'Authorization': `Bearer ${longLivedData.access_token}` } }
+    );
+    if (!subscribeRes.ok) {
+      const subErr = await subscribeRes.json().catch(() => ({}));
+      console.error('[WhatsApp] Failed to subscribe app to WABA webhooks:', subErr);
+      // Don't hard-fail the connection over this — save what we have and
+      // surface a clear warning; the number is connected but won't
+      // receive messages until this subscription succeeds. Better than
+      // losing the whole connection over a retriable step.
+    }
+
+    await prisma.user.update({
+      where: { id: req.user.userId },
+      data: {
+        whatsappToken: longLivedData.access_token,
+        whatsappPhoneNumberId: phoneNumberId,
+        whatsappWabaId: wabaId,
+      },
+    });
+
+    res.json({ success: true, subscribedToWebhooks: subscribeRes.ok });
+  } catch (err) {
+    console.error('[WhatsApp] Connect error:', err.message);
+    res.status(500).json({ error: 'Failed to complete WhatsApp connection.' });
+  }
+});
+
+// POST — disconnect a per-user WhatsApp connection
+app.post('/api/whatsapp/disconnect', authenticateToken, async (req, res) => {
+  try {
+    await prisma.user.update({
+      where: { id: req.user.userId },
+      data: { whatsappToken: null, whatsappPhoneNumberId: null, whatsappWabaId: null },
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to disconnect WhatsApp.' });
   }
 });
 
