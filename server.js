@@ -453,7 +453,15 @@ app.get('/api/auth/facebook', (req, res) => {
     // Login") than the Page-linked Messenger flow this app uses. Confirmed
     // by testing, not assumed — don't switch this back without re-checking
     // the dashboard first.
-    scope: 'pages_show_list,pages_messaging,pages_manage_metadata,pages_read_engagement,business_management,instagram_basic,instagram_manage_messages',
+    // pages_read_engagement was removed here after App Review correctly
+    // rejected it: "your app's use case for the requested permission is
+    // invalid or is not needed to support its core functionality." That
+    // was accurate — nothing in this codebase ever reads Page posts,
+    // comments, or engagement data; CareAgent only needs to list Pages,
+    // send/receive DMs, and subscribe webhooks. Requesting a permission
+    // the app doesn't use isn't just a review-blocker, it's a real
+    // least-privilege violation worth fixing regardless of App Review.
+    scope: 'pages_show_list,pages_messaging,pages_manage_metadata,business_management,instagram_basic,instagram_manage_messages',
     response_type: 'code',
   });
   res.redirect(`https://www.facebook.com/v19.0/dialog/oauth?${params}`);
