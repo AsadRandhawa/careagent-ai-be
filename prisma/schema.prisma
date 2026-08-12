@@ -10,67 +10,51 @@ datasource db {
 }
 
 model User {
-  id                    String         @id @default(uuid())
-  email                 String         @unique
+  id                    String          @id @default(uuid())
+  email                 String          @unique
   password              String
-  documents             Json?          @default("[]")
+  documents             Json?           @default("[]")
   businessIdentity      String?
   brandVoice            String?
   googleTokens          Json?
-  whatsappToken         String?
+  createdAt             DateTime        @default(now())
+  updatedAt             DateTime        @updatedAt
   whatsappPhoneNumberId String?
+  whatsappToken         String?
   whatsappWabaId        String?
-
-  // Facebook Messenger
+  gmailEnabled          Boolean         @default(true)
+  lastSeenEscalAt       DateTime?
+  lastSeenInboxAt       DateTime?
+  aiAutoDrafting        Boolean         @default(true)
+  autoClassification    Boolean         @default(true)
+  sentimentTracking     Boolean         @default(false)
+  plan                  String          @default("startup")
+  stripeCustomerId      String?
+  stripeSubscriptionId  String?
+  livechatEnabled       Boolean         @default(false)
+  livechatToken         String?         @unique
+  facebookConnected     Boolean         @default(false)
   facebookPageId        String?
   facebookPageName      String?
   facebookPageToken     String?
-  facebookConnected     Boolean        @default(false)
-  facebookEnabled       Boolean        @default(true)
-
-  // Instagram DMs (via linked Facebook Page)
+  facebookEnabled       Boolean         @default(true)
   instagramBusinessId   String?
+  instagramConnected    Boolean         @default(false)
+  instagramEnabled      Boolean         @default(true)
   instagramUsername     String?
-  instagramConnected    Boolean        @default(false)
-  instagramEnabled      Boolean        @default(true)
-
-  tickets               Ticket[]
-  documentChunks        DocumentChunk[]
   chatSessions          ChatSession[]
-
-  // Live Chat
-  livechatToken         String?        @unique
-  livechatEnabled       Boolean        @default(false)
-
-  // Stripe billing
-  stripeCustomerId      String?
-  stripeSubscriptionId  String?
-  plan                  String         @default("startup")
-
-  // Channel preferences
-  gmailEnabled          Boolean        @default(true)
-
-  // Automation settings
-  aiAutoDrafting        Boolean        @default(true)
-  autoClassification    Boolean        @default(true)
-  sentimentTracking     Boolean        @default(false)
-
-  // Sidebar badge tracking
-  lastSeenInboxAt       DateTime?
-  lastSeenEscalAt       DateTime?
-
-  createdAt             DateTime       @default(now())
-  updatedAt             DateTime       @updatedAt
+  documentChunks        DocumentChunk[]
+  tickets               Ticket[]
 }
 
 model DocumentChunk {
-  id        String                       @id @default(uuid())
+  id        String                @id @default(uuid())
   userId    String
-  user      User                         @relation(fields: [userId], references: [id], onDelete: Cascade)
   docName   String
   content   String
-  embedding Unsupported("vector(1536)")
-  createdAt DateTime                     @default(now())
+  embedding Unsupported("vector")
+  createdAt DateTime              @default(now())
+  user      User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
   @@index([userId, docName])
@@ -79,7 +63,6 @@ model DocumentChunk {
 model Ticket {
   id               String    @id @default(uuid())
   userId           String
-  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   externalId       String
   threadId         String?
   customerName     String
@@ -92,29 +75,31 @@ model Ticket {
   sentiment        String    @default("Neutral")
   category         String    @default("General")
   urgency          Int       @default(1)
-  escalationReason String?
   receivedAt       DateTime  @default(now())
   resolvedAt       DateTime?
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
+  escalationReason String?
+  Message          Message[]
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, externalId])
+  @@unique([userId, channel, threadId])
   @@index([userId, status])
   @@index([userId, receivedAt])
   @@index([userId, channel])
 }
 
-// ── Live Chat ─────────────────────────────────────────────────────────────────
 model ChatSession {
   id          String        @id @default(uuid())
   userId      String
-  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   visitorId   String
   visitorName String        @default("Visitor")
-  status      String        @default("active")  // active | resolved
+  status      String        @default("active")
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
   messages    ChatMessage[]
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
   @@index([userId, status])
@@ -124,10 +109,24 @@ model ChatSession {
 model ChatMessage {
   id        String      @id @default(uuid())
   sessionId String
-  session   ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  role      String      // "visitor" | "agent"
+  role      String
   content   String
   createdAt DateTime    @default(now())
+  session   ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
   @@index([sessionId, createdAt])
+}
+
+model Message {
+  id         String   @id @default(dbgenerated("gen_random_uuid()"))
+  ticketId   String
+  externalId String?
+  direction  String
+  content    String
+  senderName String?
+  createdAt  DateTime @default(now())
+  Ticket     Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@unique([ticketId, externalId])
+  @@index([ticketId, createdAt])
 }
