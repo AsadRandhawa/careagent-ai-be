@@ -666,6 +666,27 @@ app.post('/api/tickets/dismiss', authenticateToken, async (req, res) => {
   }
 });
 
+// GET — full message history for one conversation (any channel). Ownership-
+// checked via userId so one account can't page through another's tickets by
+// guessing ids.
+app.get('/api/tickets/:id/messages', authenticateToken, async (req, res) => {
+  try {
+    const ticket = await prisma.ticket.findFirst({
+      where: { id: req.params.id, userId: req.user.userId },
+    });
+    if (!ticket) return res.status(404).json({ error: 'Ticket not found.' });
+
+    const messages = await prisma.message.findMany({
+      where: { ticketId: ticket.id },
+      orderBy: { createdAt: 'asc' },
+    });
+    res.json(messages);
+  } catch (err) {
+    console.error('[tickets/:id/messages]', err.message);
+    res.status(500).json({ error: 'Failed to fetch message history.' });
+  }
+});
+
 // ── Helper: verify Paddle Billing webhook signature ─────────────────────────
 // Paddle Billing sends a `Paddle-Signature` header shaped like:
 //   ts=1671552777;h1=<hex hmac-sha256 of "${ts}:${rawBody}">
@@ -1454,23 +1475,13 @@ app.post('/api/facebook/webhook', async (req, res) => {
           if (profile.name) customerName = profile.name;
         } catch (_) {}
 
-        await prisma.ticket.upsert({
-          where: { userId_externalId: { userId: user.id, externalId: event.message.mid } },
-          update: {},
-          create: {
-            userId: user.id,
-            externalId: event.message.mid,
-            threadId: senderId, // Messenger PSID — used to route replies
-            customerName,
-            customerEmail: null,
-            subject: 'Facebook Messenger',
-            content: text,
-            channel: 'facebook',
-            status: 'new',
-            sentiment: 'Neutral',
-            category: 'General',
-            receivedAt: new Date(event.timestamp),
-          },
+        const receivedAt = new Date(event.timestamp);
+        const ticket = await getOrCreateTicket({
+          userId: user.id, channel: 'facebook', threadId: senderId, externalId: event.message.mid,
+          customerName, subject: 'Facebook Messenger', content: text, receivedAt,
+        });
+        await recordMessage(ticket, {
+          direction: 'inbound', externalId: event.message.mid, content: text, senderName: customerName, at: receivedAt,
         });
       }
     }
@@ -1490,7 +1501,7 @@ app.get('/api/facebook/tickets', authenticateToken, async (req, res) => {
       orderBy: { receivedAt: 'desc' },
     });
     res.json(tickets.map(t => ({
-      id: t.externalId,
+      id: t.id,
       threadId: t.threadId,
       customerName: t.customerName,
       initials: (t.customerName || 'U').substring(0, 2).toUpperCase(),
@@ -1537,10 +1548,12 @@ app.post('/api/facebook/reply', authenticateToken, requireIdempotencyKey, async 
     }
 
     if (ticketId) {
-      await prisma.ticket.updateMany({
-        where: { userId: req.user.userId, externalId: ticketId },
-        data: { status: 'resolved', resolvedAt: new Date() },
-      });
+      const ticket = await prisma.ticket.findFirst({ where: { id: ticketId, userId: req.user.userId, channel: 'facebook' } });
+      if (ticket) {
+        const sendData = await sendRes.json().catch(() => ({}));
+        await recordMessage(ticket, { direction: 'outbound', externalId: sendData?.message_id || null, content: body, senderName: 'Agent' });
+        await prisma.ticket.update({ where: { id: ticket.id }, data: { status: 'resolved', resolvedAt: new Date() } });
+      }
     }
 
     res.json({ success: true });
@@ -1598,23 +1611,13 @@ app.post('/api/instagram/webhook', async (req, res) => {
           if (profile.name) customerName = profile.name;
         } catch (_) {}
 
-        await prisma.ticket.upsert({
-          where: { userId_externalId: { userId: user.id, externalId: event.message.mid } },
-          update: {},
-          create: {
-            userId: user.id,
-            externalId: event.message.mid,
-            threadId: senderId, // Instagram-scoped sender ID — used to route replies
-            customerName,
-            customerEmail: null,
-            subject: 'Instagram DM',
-            content: text,
-            channel: 'instagram',
-            status: 'new',
-            sentiment: 'Neutral',
-            category: 'General',
-            receivedAt: new Date(event.timestamp),
-          },
+        const receivedAt = new Date(event.timestamp);
+        const ticket = await getOrCreateTicket({
+          userId: user.id, channel: 'instagram', threadId: senderId, externalId: event.message.mid,
+          customerName, subject: 'Instagram DM', content: text, receivedAt,
+        });
+        await recordMessage(ticket, {
+          direction: 'inbound', externalId: event.message.mid, content: text, senderName: customerName, at: receivedAt,
         });
       }
     }
@@ -1634,7 +1637,7 @@ app.get('/api/instagram/tickets', authenticateToken, async (req, res) => {
       orderBy: { receivedAt: 'desc' },
     });
     res.json(tickets.map(t => ({
-      id: t.externalId,
+      id: t.id,
       threadId: t.threadId,
       customerName: t.customerName,
       initials: (t.customerName || 'U').substring(0, 2).toUpperCase(),
@@ -1683,10 +1686,12 @@ app.post('/api/instagram/reply', authenticateToken, requireIdempotencyKey, async
     }
 
     if (ticketId) {
-      await prisma.ticket.updateMany({
-        where: { userId: req.user.userId, externalId: ticketId },
-        data: { status: 'resolved', resolvedAt: new Date() },
-      });
+      const ticket = await prisma.ticket.findFirst({ where: { id: ticketId, userId: req.user.userId, channel: 'instagram' } });
+      if (ticket) {
+        const sendData = await sendRes.json().catch(() => ({}));
+        await recordMessage(ticket, { direction: 'outbound', externalId: sendData?.message_id || null, content: body, senderName: 'Agent' });
+        await prisma.ticket.update({ where: { id: ticket.id }, data: { status: 'resolved', resolvedAt: new Date() } });
+      }
     }
 
     res.json({ success: true });
@@ -1792,25 +1797,15 @@ app.post('/api/whatsapp/webhook', async (req, res) => {
         for (const msg of messages) {
           const contact = contacts.find(c => c.wa_id === msg.from) || {};
           const customerName = contact.profile?.name || msg.from;
+          const text = extractWhatsAppMessageText(msg);
+          const receivedAt = new Date(Number(msg.timestamp) * 1000);
 
-          await prisma.ticket.upsert({
-            where: { userId_externalId: { userId: user.id, externalId: msg.id } },
-            update: {},
-            create: {
-              userId: user.id,
-              externalId: msg.id,
-              threadId: msg.from, // customer's WhatsApp number — used to route replies
-              customerName,
-              customerEmail: null,
-              phoneNumber: msg.from,
-              subject: 'WhatsApp message',
-              content: extractWhatsAppMessageText(msg),
-              channel: 'whatsapp',
-              status: 'new',
-              sentiment: 'Neutral',
-              category: 'General',
-              receivedAt: new Date(Number(msg.timestamp) * 1000),
-            },
+          const ticket = await getOrCreateTicket({
+            userId: user.id, channel: 'whatsapp', threadId: msg.from, externalId: msg.id,
+            customerName, phoneNumber: msg.from, subject: 'WhatsApp message', content: text, receivedAt,
+          });
+          await recordMessage(ticket, {
+            direction: 'inbound', externalId: msg.id, content: text, senderName: customerName, at: receivedAt,
           });
         }
       }
@@ -1819,6 +1814,59 @@ app.post('/api/whatsapp/webhook', async (req, res) => {
     console.error('[WhatsApp] Webhook processing error:', err.message);
   }
 });
+
+// ── Conversation helpers (Message-table aware) ──────────────────────────────
+// Threading key is (userId, channel, threadId) — NOT the individual message
+// id. Previously every webhook handler upserted on the message's own id,
+// which is never reused, so the `create` branch always fired and every new
+// customer message became its own Ticket row regardless of threadId. This
+// finds-or-creates by the actual conversation thread instead.
+async function getOrCreateTicket({ userId, channel, threadId, externalId, customerName, customerEmail, phoneNumber, subject, content, receivedAt }) {
+  if (threadId) {
+    const existing = await prisma.ticket.findUnique({
+      where: { userId_channel_threadId: { userId, channel, threadId } },
+    });
+    if (existing) return existing;
+  }
+  // No existing conversation on this thread (or no threadId at all — e.g.
+  // legacy Gmail rows) — start a new one, keyed by the first message's id.
+  return prisma.ticket.create({
+    data: {
+      userId, channel, threadId: threadId || null, externalId,
+      customerName:  customerName || 'Unknown',
+      customerEmail: customerEmail || null,
+      phoneNumber:   phoneNumber || null,
+      subject:       subject || null,
+      content:       content || '',
+      status:        'new',
+      sentiment:     'Neutral',
+      category:      'General',
+      receivedAt:    receivedAt || new Date(),
+    },
+  });
+}
+
+// Appends one message to a conversation's history and keeps the ticket's
+// preview fields (content/receivedAt) in sync, so any existing code that
+// still reads ticket.content directly keeps working unmodified. Reopens a
+// resolved conversation when the customer writes back after it was closed.
+// Uses upsert-on-externalId so a Meta webhook retry (same message delivered
+// twice) doesn't create a duplicate Message row.
+async function recordMessage(ticket, { direction, externalId, content, senderName, at }) {
+  if (externalId) {
+    await prisma.message.upsert({
+      where: { ticketId_externalId: { ticketId: ticket.id, externalId } },
+      update: {}, // already recorded — webhook retry, not a new message
+      create: { ticketId: ticket.id, externalId, direction, content, senderName },
+    });
+  } else {
+    await prisma.message.create({ data: { ticketId: ticket.id, direction, content, senderName } });
+  }
+
+  const data = { content, receivedAt: at || new Date() };
+  if (direction === 'inbound' && ticket.status === 'resolved') data.status = 'new';
+  await prisma.ticket.update({ where: { id: ticket.id }, data });
+}
 
 // Deterministically picks an avatar color for a given seed (customer name,
 // email, phone number — anything stable for that customer). Replaces the
@@ -1927,6 +1975,9 @@ app.post('/api/whatsapp/reply', authenticateToken, requireIdempotencyKey, async 
       return res.status(502).json({ error: errBody?.error?.message || 'Failed to send WhatsApp message.' });
     }
 
+    const waData = await waRes.json().catch(() => ({}));
+    const sentId = waData?.messages?.[0]?.id || null;
+    await recordMessage(ticket, { direction: 'outbound', externalId: sentId, content: message, senderName: 'Agent' });
     await prisma.ticket.update({ where: { id: ticket.id }, data: { status: 'resolved', resolvedAt: new Date() } });
     res.json({ success: true });
   } catch (err) {
