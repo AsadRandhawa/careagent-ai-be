@@ -83,6 +83,30 @@ const authLimiter = rateLimit({
 
 const prisma = new PrismaClient();
 
+// ── External RAG routing (per-account override) ─────────────────────────────
+// Certain WhatsApp accounts run their own purpose-built RAG/chatbot service
+// instead of CareAgent's native OpenAI+pgvector pipeline — e.g. Lahore Leads
+// University's admissions bot, which has its own knowledge base and
+// lead-qualification behavior baked into its own prompt. Keyed by CareAgent
+// userId (not channel/global), since this is specific to individual accounts
+// that have their own external service, not a platform-wide setting.
+//
+// AUTO-SEND: accounts listed here bypass the normal human-drafts/agent-
+// approves flow entirely for WhatsApp — the external service's answer is
+// sent back automatically the moment a message arrives. This is a real,
+// deliberate behavior change from every other channel/account, where a
+// human always reviews before anything sends. Only turn this on for an
+// account once its external service's own escalation/fallback behavior is
+// trustworthy — there is no CareAgent-side review step catching a bad
+// answer before the customer sees it, only the external service's own
+// needs_followup signal, escalating AFTER the fact.
+const EXTERNAL_RAG_MAP = {
+  '0437029b-c10b-4451-bafb-7992769ddb48': { // admissions@leads.edu.pk
+    baseUrl: 'https://leads-islamabad-chatbot-production.up.railway.app',
+    secretEnvVar: 'LEADS_ISLAMABAD_RAG_SECRET',
+  },
+};
+
 const openai = new OpenAI({
   apiKey: process.env.VITE_OPENAI_API_KEY || process.env.OPENAI_API_KEY
 });
@@ -1807,6 +1831,7 @@ app.post('/api/whatsapp/webhook', async (req, res) => {
           await recordMessage(ticket, {
             direction: 'inbound', externalId: msg.id, content: text, senderName: customerName, at: receivedAt,
           });
+          await tryAutoReplyViaExternalRag(user, ticket, text);
         }
       }
     }
@@ -1866,6 +1891,124 @@ async function recordMessage(ticket, { direction, externalId, content, senderNam
   const data = { content, receivedAt: at || new Date() };
   if (direction === 'inbound' && ticket.status === 'resolved') data.status = 'new';
   await prisma.ticket.update({ where: { id: ticket.id }, data });
+}
+
+// Sends a WhatsApp text message via the Cloud API for a given ticket/user
+// and records it as an outbound Message. Shared by both the agent-
+// triggered reply route and the auto-reply path below, so the two can't
+// silently drift out of sync on error handling. Throws on failure — callers
+// decide what that means for them (an HTTP error response for the manual
+// route, a silent "leave it for a human" for the auto-reply path).
+async function sendWhatsAppMessage(user, ticket, text, senderName = 'Agent') {
+  const accessToken   = user?.whatsappToken || process.env.WHATSAPP_ACCESS_TOKEN;
+  const phoneNumberId = user?.whatsappPhoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID;
+  if (!accessToken || !phoneNumberId) {
+    throw new Error('WhatsApp is not connected for this account.');
+  }
+
+  const waRes = await fetch(
+    `https://graph.facebook.com/v19.0/${phoneNumberId}/messages`,
+    {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to: ticket.threadId,
+        type: 'text',
+        text: { body: text },
+      }),
+    }
+  );
+  if (!waRes.ok) {
+    const errBody = await waRes.json().catch(() => ({}));
+    throw new Error(errBody?.error?.message || 'Failed to send WhatsApp message.');
+  }
+  const waData = await waRes.json().catch(() => ({}));
+  const sentId = waData?.messages?.[0]?.id || null;
+  await recordMessage(ticket, { direction: 'outbound', externalId: sentId, content: text, senderName });
+  return sentId;
+}
+
+// ── Autonomous reply via an account's external RAG service ─────────────────
+// Checks EXTERNAL_RAG_MAP for this account and, if configured, gets an
+// answer and sends it back immediately — no human review step. This
+// function must NEVER throw and must NEVER leave the ticket in a broken
+// state: any failure (missing secret, network error, timeout, bad
+// response shape) simply returns without sending anything, leaving the
+// ticket exactly as a normal new inbound message for a human to handle
+// through the regular Inbox draft/approve flow. Silent-degrade-to-human,
+// never silent-degrade-to-nothing.
+const EXTERNAL_RAG_TIMEOUT_MS = 20000;
+
+async function tryAutoReplyViaExternalRag(user, ticket, currentMessageText) {
+  const config = EXTERNAL_RAG_MAP[user.id];
+  if (!config) return; // this account doesn't use an external RAG service
+
+  const secret = process.env[config.secretEnvVar];
+  if (!secret) {
+    console.error(`[ExternalRAG] ${config.secretEnvVar} is not set — skipping auto-reply for user ${user.id}, leaving for human review.`);
+    return;
+  }
+
+  try {
+    // Build conversation history from everything recorded on this ticket
+    // BEFORE the current message (which was just recorded by the caller) —
+    // the external service wants the current question passed separately
+    // via `message`, not folded into `history`.
+    const priorMessages = await prisma.message.findMany({
+      where: { ticketId: ticket.id },
+      orderBy: { createdAt: 'asc' },
+    });
+    const history = priorMessages
+      .slice(0, -1)
+      .map(m => ({ role: m.direction === 'outbound' ? 'assistant' : 'user', content: m.content }));
+
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => controller.abort(), EXTERNAL_RAG_TIMEOUT_MS);
+    let ragRes;
+    try {
+      ragRes = await fetch(`${config.baseUrl}/partner/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CareAgent-Secret': secret },
+        body: JSON.stringify({ message: currentMessageText, history }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
+
+    if (!ragRes.ok) {
+      console.error(`[ExternalRAG] ${config.baseUrl} returned HTTP ${ragRes.status} for ticket ${ticket.id} — leaving for human review.`);
+      return;
+    }
+    const ragData = await ragRes.json().catch(() => null);
+    if (!ragData || typeof ragData.answer !== 'string' || !ragData.answer.trim()) {
+      console.error(`[ExternalRAG] Malformed/empty response from ${config.baseUrl} for ticket ${ticket.id} — leaving for human review.`);
+      return;
+    }
+
+    await sendWhatsAppMessage(user, ticket, ragData.answer, 'AI (auto-reply)');
+
+    if (ragData.needs_followup) {
+      await prisma.ticket.update({
+        where: { id: ticket.id },
+        data: {
+          status: 'escalated',
+          escalationReason: 'Auto-reply sent, but the bot flagged this question for human follow-up.',
+        },
+      });
+    } else {
+      await prisma.ticket.update({
+        where: { id: ticket.id },
+        data: { status: 'resolved', resolvedAt: new Date() },
+      });
+    }
+  } catch (err) {
+    // Network error, timeout (AbortError), or anything else unexpected —
+    // fail closed. The ticket stays exactly as a normal new inbound
+    // message; nothing was sent, nothing was marked resolved/escalated.
+    console.error(`[ExternalRAG] Auto-reply failed for ticket ${ticket.id}, leaving for human review:`, err.message);
+  }
 }
 
 // Deterministically picks an avatar color for a given seed (customer name,
@@ -1946,38 +2089,14 @@ app.post('/api/whatsapp/reply', authenticateToken, requireIdempotencyKey, async 
     if (!ticket?.threadId) return res.status(404).json({ error: 'WhatsApp ticket not found.' });
 
     const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
-    const accessToken   = user?.whatsappToken || process.env.WHATSAPP_ACCESS_TOKEN;
-    const phoneNumberId = user?.whatsappPhoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID;
 
-    if (!accessToken || !phoneNumberId) {
-      return res.status(400).json({ error: 'WhatsApp is not connected for this account.' });
+    try {
+      await sendWhatsAppMessage(user, ticket, message, 'Agent');
+    } catch (sendErr) {
+      console.error('[WhatsApp] Send failed:', sendErr.message);
+      return res.status(502).json({ error: sendErr.message });
     }
 
-    const waRes = await fetch(
-      `https://graph.facebook.com/v19.0/${phoneNumberId}/messages`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${accessToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          messaging_product: 'whatsapp',
-          to: ticket.threadId,
-          type: 'text',
-          text: { body: message },
-        }),
-      }
-    );
-    if (!waRes.ok) {
-      const errBody = await waRes.json().catch(() => ({}));
-      console.error('[WhatsApp] Send failed:', errBody);
-      return res.status(502).json({ error: errBody?.error?.message || 'Failed to send WhatsApp message.' });
-    }
-
-    const waData = await waRes.json().catch(() => ({}));
-    const sentId = waData?.messages?.[0]?.id || null;
-    await recordMessage(ticket, { direction: 'outbound', externalId: sentId, content: message, senderName: 'Agent' });
     await prisma.ticket.update({ where: { id: ticket.id }, data: { status: 'resolved', resolvedAt: new Date() } });
     res.json({ success: true });
   } catch (err) {
