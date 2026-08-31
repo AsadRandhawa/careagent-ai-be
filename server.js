@@ -945,14 +945,31 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
     } catch (e) { console.error('Gmail count error:', e.message); }
 
     const [
-      resolvedThisPeriod, escalated, volumeTrend,
+      resolvedThisPeriod, escalated, escalatedThisPeriod, volumeTrend,
       nonGmailOpenTickets, activeLivechatSessions,
       resolvedForAvgTime,
     ] = await Promise.all([
       // Count resolved in this period
       prisma.ticket.count({ where: { userId, status: 'resolved', resolvedAt: { gte: since } } }),
-      // Count escalated
+      // All-time count of tickets CURRENTLY sitting in escalated status —
+      // this is a "how much needs attention right now" snapshot, not a
+      // period metric, so it deliberately has no date filter. This is
+      // what the Topbar badge and the "Escalated" stat row both read —
+      // an old unresolved escalation shouldn't silently vanish from those
+      // just because it's more than 30 days old.
       prisma.ticket.count({ where: { userId, status: 'escalated' } }),
+      // Separately, a PERIOD-SCOPED escalated count — used only for the
+      // escalation *rate* below, so the rate actually compares outcomes
+      // from the same window instead of mixing an all-time numerator with
+      // a 30-day-scoped denominator (the bug this replaces: the rate used
+      // to silently drift upward over time as old escalations piled up in
+      // the numerator while the denominator kept rolling forward).
+      // Ticket has no dedicated `escalatedAt` column — `updatedAt` is used
+      // as a close proxy, since escalating a ticket updates that row and
+      // it's typically not touched again until a human acts on it. Not
+      // perfectly precise, but far more honest than the old all-time
+      // numerator was.
+      prisma.ticket.count({ where: { userId, status: 'escalated', updatedAt: { gte: since } } }),
       // Volume by week for chart
       prisma.ticket.groupBy({
         by: ['receivedAt'],
@@ -978,8 +995,17 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
 
     const openTickets = gmailOpenCount + nonGmailOpenTickets + activeLivechatSessions;
     const resolvedCount = (Number.isFinite(resolvedThisPeriod) ? resolvedThisPeriod : 0);
-    const total = openTickets + resolvedCount;
-    const escalationRate = (total > 0 && escalated > 0) ? ((escalated / total) * 100).toFixed(1) + '%' : '0.0%';
+
+    // Escalation rate: of every conversation that reached a real outcome
+    // in this period (resolved OR escalated), what fraction needed
+    // escalation? Deliberately excludes openTickets from the denominator —
+    // a still-open ticket hasn't reached either outcome yet, so including
+    // it would dilute the rate with conversations that aren't decided.
+    // Both sides of this ratio are now scoped to the same `since` window.
+    const decidedThisPeriod = resolvedCount + escalatedThisPeriod;
+    const escalationRate = decidedThisPeriod > 0
+      ? ((escalatedThisPeriod / decidedThisPeriod) * 100).toFixed(1) + '%'
+      : '0.0%';
 
     // Average resolution time — mean of (resolvedAt - receivedAt) across
     // every ticket actually resolved in this period. Previously this was
