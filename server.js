@@ -1035,7 +1035,14 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
       }, 0);
       const avgMs = totalMs / resolvedForAvgTime.length;
       const avgMinutes = avgMs / (1000 * 60);
-      if (avgMinutes < 60) {
+      if (avgMinutes < 1) {
+        // Sub-minute resolutions (e.g. the WhatsApp bot's instant
+        // auto-replies) previously rounded down to a flat, misleading
+        // "0 min" — showing seconds here instead reflects what actually
+        // happened rather than hiding it behind a rounding artifact.
+        const avgSeconds = Math.max(1, Math.round(avgMs / 1000));
+        avgResolutionTime = `${avgSeconds} sec`;
+      } else if (avgMinutes < 60) {
         avgResolutionTime = `${Math.round(avgMinutes)} min`;
       } else if (avgMinutes < 60 * 24) {
         avgResolutionTime = `${(avgMinutes / 60).toFixed(1)} hrs`;
