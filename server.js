@@ -930,7 +930,10 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
     const userId = req.user.userId;
 
-    // Get live Gmail inbox count for open tickets
+    // Get live Gmail inbox count — Gmail's true "open" state lives in the
+    // Gmail inbox itself (a Ticket row only exists once synced/replied to),
+    // so this is the only channel that needs a live API call rather than a
+    // DB count.
     let gmailOpenCount = 0;
     try {
       const user = await prisma.user.findUnique({ where: { id: userId } });
@@ -941,7 +944,11 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
       }
     } catch (e) { console.error('Gmail count error:', e.message); }
 
-    const [resolvedThisPeriod, escalated, volumeTrend] = await Promise.all([
+    const [
+      resolvedThisPeriod, escalated, volumeTrend,
+      nonGmailOpenTickets, activeLivechatSessions,
+      resolvedForAvgTime,
+    ] = await Promise.all([
       // Count resolved in this period
       prisma.ticket.count({ where: { userId, status: 'resolved', resolvedAt: { gte: since } } }),
       // Count escalated
@@ -952,13 +959,47 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
         where: { userId, receivedAt: { gte: since } },
         _count: true,
         orderBy: { receivedAt: 'asc' }
-      })
+      }),
+      // Open tickets on every channel EXCEPT Gmail (WhatsApp, Facebook,
+      // Instagram) — previously this whole category was silently ignored,
+      // so an account using only WhatsApp (e.g. Lahore Leads University)
+      // would show "0 Open Tickets" no matter how much real activity it had.
+      prisma.ticket.count({ where: { userId, channel: { not: 'gmail' }, status: 'new' } }),
+      // Website Live Chat doesn't use the Ticket table at all — its
+      // "tickets" come from ChatSession, so it needs its own count.
+      prisma.chatSession.count({ where: { userId, status: 'active' } }),
+      // For avg resolution time: every ticket resolved in this period that
+      // actually has both timestamps needed to compute a duration.
+      prisma.ticket.findMany({
+        where: { userId, status: 'resolved', resolvedAt: { gte: since, not: null } },
+        select: { receivedAt: true, resolvedAt: true },
+      }),
     ]);
 
-    const openTickets = gmailOpenCount;
+    const openTickets = gmailOpenCount + nonGmailOpenTickets + activeLivechatSessions;
     const resolvedCount = (Number.isFinite(resolvedThisPeriod) ? resolvedThisPeriod : 0);
     const total = openTickets + resolvedCount;
     const escalationRate = (total > 0 && escalated > 0) ? ((escalated / total) * 100).toFixed(1) + '%' : '0.0%';
+
+    // Average resolution time — mean of (resolvedAt - receivedAt) across
+    // every ticket actually resolved in this period. Previously this was
+    // hardcoded to the literal string 'N/A' and never computed at all.
+    let avgResolutionTime = 'N/A';
+    if (resolvedForAvgTime.length > 0) {
+      const totalMs = resolvedForAvgTime.reduce((sum, t) => {
+        const ms = new Date(t.resolvedAt) - new Date(t.receivedAt);
+        return sum + (Number.isFinite(ms) && ms > 0 ? ms : 0);
+      }, 0);
+      const avgMs = totalMs / resolvedForAvgTime.length;
+      const avgMinutes = avgMs / (1000 * 60);
+      if (avgMinutes < 60) {
+        avgResolutionTime = `${Math.round(avgMinutes)} min`;
+      } else if (avgMinutes < 60 * 24) {
+        avgResolutionTime = `${(avgMinutes / 60).toFixed(1)} hrs`;
+      } else {
+        avgResolutionTime = `${(avgMinutes / (60 * 24)).toFixed(1)} days`;
+      }
+    }
 
     // Build weekly volume buckets
     const weeklyMap = {};
@@ -974,7 +1015,14 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
       resolvedThisPeriod: parseInt(resolvedCount) || 0,
       escalated:          parseInt(escalated) || 0,
       escalationRate,
-      avgResolutionTime: 'N/A',
+      avgResolutionTime,
+      // NOTE: there's no real tracked signal yet for "has an AI draft
+      // specifically awaiting approval" vs. "is just a new ticket" — every
+      // GET /tickets endpoint hardcodes hasDraft: true regardless of
+      // whether /api/ai/draft was ever actually called for that ticket.
+      // Mirroring openTickets here is an honest simplification given that
+      // gap, not a guess dressed up as a distinct metric — revisit once
+      // draft-generation is actually tracked per ticket.
       aiDraftsReady: openTickets,
       sentimentPct: await (async () => {
         const total_s = await prisma.ticket.count({ where: { userId } });
