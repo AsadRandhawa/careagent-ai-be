@@ -948,6 +948,7 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
       resolvedThisPeriod, escalated, escalatedThisPeriod, volumeTrend,
       nonGmailOpenTickets, activeLivechatSessions,
       resolvedForAvgTime,
+      ticketsForReplyRate, sessionsForReplyRate,
     ] = await Promise.all([
       // Count resolved in this period
       prisma.ticket.count({ where: { userId, status: 'resolved', resolvedAt: { gte: since } } }),
@@ -991,6 +992,22 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
         where: { userId, status: 'resolved', resolvedAt: { gte: since, not: null } },
         select: { receivedAt: true, resolvedAt: true },
       }),
+      // Source data for channel reply-rate aggregation (see
+      // computeChannelReplyRates above) — Gmail excluded, doesn't write to
+      // the Message table.
+      prisma.ticket.findMany({
+        where: { userId, channel: { in: ['whatsapp', 'facebook', 'instagram'] }, receivedAt: { gte: since } },
+        select: {
+          channel: true, status: true,
+          Message: { select: { direction: true, createdAt: true } },
+        },
+      }),
+      prisma.chatSession.findMany({
+        where: { userId, createdAt: { gte: since } },
+        select: {
+          messages: { select: { role: true, createdAt: true } },
+        },
+      }),
     ]);
 
     const openTickets = gmailOpenCount + nonGmailOpenTickets + activeLivechatSessions;
@@ -1026,6 +1043,8 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
         avgResolutionTime = `${(avgMinutes / (60 * 24)).toFixed(1)} days`;
       }
     }
+
+    const channelReplyRates = computeChannelReplyRates(ticketsForReplyRate, sessionsForReplyRate);
 
     // Build weekly volume buckets
     const weeklyMap = {};
@@ -1066,7 +1085,8 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
       })(),
       categoryStats: [{ name: 'General', value: 100, count: openTickets }],
       volumeTrend: volumeData,
-      miniBarData: []
+      miniBarData: [],
+      channelReplyRates
     });
   } catch (err) {
     console.error('Stats error:', err);
@@ -2093,6 +2113,97 @@ async function tryAutoReplyViaExternalRag(user, ticket, currentMessageText) {
 // visible, easily-noticed bug (a customer's avatar color would change
 // every time the inbox refreshed) and left unfixed until now.
 const AVATAR_VARIANTS = ['blue', 'purple', 'green', 'teal', 'warn', 'danger'];
+// ── Channel reply-rate aggregation ──────────────────────────────────────────
+// Pure function, unit-tested in isolation before being wired in here —
+// covers: unanswered tickets counting toward totalTickets without skewing
+// avgSecs, out-of-order message arrays being sorted rather than trusted,
+// and AI auto-replies counting as legitimate first replies (same as a
+// human agent's) per an explicit decision, not an oversight. Gmail is
+// deliberately excluded — it doesn't write to the Message table (its own
+// API is the source of truth for it), so "first reply time" isn't
+// computable for it the same way as the other channels.
+const REPLY_RATE_DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const REPLY_RATE_CHANNEL_DISPLAY = { whatsapp: 'WhatsApp', facebook: 'Facebook', instagram: 'Instagram' };
+const REPLY_RATE_CHANNEL_COLOR = { WhatsApp: '#25D366', Facebook: '#1877F2', Instagram: '#E1306C', Website: '#14B8A6' };
+
+function computeChannelReplyRates(ticketsWithMessages, sessionsWithMessages) {
+  const acc = {};
+
+  function ensureBucket(name) {
+    if (!acc[name]) {
+      acc[name] = { secsSum: 0, count: 0, repliedCount: 0, escalated: 0, dayBuckets: {} };
+      REPLY_RATE_DAY_LABELS.forEach(d => { acc[name].dayBuckets[d] = { sum: 0, count: 0 }; });
+    }
+    return acc[name];
+  }
+
+  for (const ticket of ticketsWithMessages) {
+    const displayName = REPLY_RATE_CHANNEL_DISPLAY[ticket.channel];
+    if (!displayName) continue;
+
+    const messages = (ticket.Message || []).slice().sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+    const firstInbound = messages.find(m => m.direction === 'inbound');
+    if (!firstInbound) continue;
+
+    const firstInboundTime = new Date(firstInbound.createdAt).getTime();
+    const firstReply = messages.find(m => m.direction === 'outbound' && new Date(m.createdAt).getTime() >= firstInboundTime);
+
+    const bucket = ensureBucket(displayName);
+    bucket.count += 1;
+    if (ticket.status === 'escalated') bucket.escalated += 1;
+
+    if (firstReply) {
+      const secs = (new Date(firstReply.createdAt).getTime() - firstInboundTime) / 1000;
+      if (secs >= 0) {
+        bucket.secsSum += secs;
+        bucket.repliedCount += 1;
+        const dayLabel = REPLY_RATE_DAY_LABELS[new Date(firstInbound.createdAt).getDay()];
+        bucket.dayBuckets[dayLabel].sum += secs;
+        bucket.dayBuckets[dayLabel].count += 1;
+      }
+    }
+  }
+
+  for (const session of sessionsWithMessages) {
+    const messages = (session.messages || []).slice().sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+    const firstVisitor = messages.find(m => m.role === 'visitor');
+    if (!firstVisitor) continue;
+
+    const firstVisitorTime = new Date(firstVisitor.createdAt).getTime();
+    const firstAgent = messages.find(m => m.role === 'agent' && new Date(m.createdAt).getTime() >= firstVisitorTime);
+
+    const bucket = ensureBucket('Website');
+    bucket.count += 1; // no 'escalated' concept exists for Live Chat sessions
+
+    if (firstAgent) {
+      const secs = (new Date(firstAgent.createdAt).getTime() - firstVisitorTime) / 1000;
+      if (secs >= 0) {
+        bucket.secsSum += secs;
+        bucket.repliedCount += 1;
+        const dayLabel = REPLY_RATE_DAY_LABELS[new Date(firstVisitor.createdAt).getDay()];
+        bucket.dayBuckets[dayLabel].sum += secs;
+        bucket.dayBuckets[dayLabel].count += 1;
+      }
+    }
+  }
+
+  // Only channels with at least one real ticket — an account that's never
+  // used Instagram shouldn't show a fake "0s avg reply" card for it.
+  return Object.entries(acc)
+    .filter(([, b]) => b.count > 0)
+    .map(([channel, b]) => ({
+      channel,
+      color: REPLY_RATE_CHANNEL_COLOR[channel],
+      totalTickets: b.count,
+      escalated: b.escalated,
+      avgSecs: b.repliedCount > 0 ? Math.round(b.secsSum / b.repliedCount) : 0,
+      data: REPLY_RATE_DAY_LABELS.map(d => ({
+        day: d,
+        secs: b.dayBuckets[d].count > 0 ? Math.round(b.dayBuckets[d].sum / b.dayBuckets[d].count) : 0,
+      })),
+    }));
+}
+
 function pickAvatarVariant(seed) {
   const s = String(seed || '');
   let hash = 0;
