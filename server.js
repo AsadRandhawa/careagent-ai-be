@@ -1388,6 +1388,50 @@ app.get('/api/tickets/insights', authenticateToken, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════
+// LEADS / REPORT — qualified WhatsApp leads (see extractLeadSignals above)
+// ═══════════════════════════════════════════════════════════
+
+// GET — list all leads for this account, most recent first
+app.get('/api/leads', authenticateToken, async (req, res) => {
+  try {
+    const leads = await prisma.lead.findMany({
+      where: { userId: req.user.userId },
+      orderBy: { updatedAt: 'desc' },
+    });
+    res.json(leads);
+  } catch (err) {
+    console.error('[leads] Failed to fetch:', err.message);
+    res.status(500).json({ error: 'Failed to fetch leads.' });
+  }
+});
+
+// PATCH — update ONLY the human-editable workflow fields. AI-populated
+// fields (name, phone, email, interestLevel, admissionEligibility, budget,
+// programInterest, keyConcerns) are intentionally not accepted here —
+// those are only ever written by extractLeadSignals, so a human editing a
+// row can't accidentally overwrite what the AI observed from the actual
+// conversation.
+app.patch('/api/leads/:id', authenticateToken, async (req, res) => {
+  try {
+    const { callStatus, reasons, leadStatus, handledBy, otherNotes } = req.body;
+    const data = {};
+    if (callStatus !== undefined) data.callStatus = callStatus;
+    if (reasons !== undefined) data.reasons = reasons;
+    if (leadStatus !== undefined) data.leadStatus = leadStatus;
+    if (handledBy !== undefined) data.handledBy = handledBy;
+    if (otherNotes !== undefined) data.otherNotes = otherNotes;
+
+    const lead = await prisma.lead.findFirst({ where: { id: req.params.id, userId: req.user.userId } });
+    if (!lead) return res.status(404).json({ error: 'Lead not found.' });
+
+    const updated = await prisma.lead.update({ where: { id: lead.id }, data });
+    res.json(updated);
+  } catch (err) {
+    console.error('[leads] Failed to update:', err.message);
+    res.status(500).json({ error: 'Failed to update lead.' });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════
 // STRIPE ROUTES
@@ -1933,6 +1977,7 @@ app.post('/api/whatsapp/webhook', async (req, res) => {
             direction: 'inbound', externalId: msg.id, content: text, senderName: customerName, at: receivedAt,
           });
           await tryAutoReplyViaExternalRag(user, ticket, text);
+          await extractLeadSignals(user, ticket);
         }
       }
     }
@@ -2109,6 +2154,106 @@ async function tryAutoReplyViaExternalRag(user, ticket, currentMessageText) {
     // fail closed. The ticket stays exactly as a normal new inbound
     // message; nothing was sent, nothing was marked resolved/escalated.
     console.error(`[ExternalRAG] Auto-reply failed for ticket ${ticket.id}, leaving for human review:`, err.message);
+  }
+}
+
+// ── Lead extraction for the Report page ─────────────────────────────────────
+// Runs AFTER a WhatsApp auto-reply, reading the full conversation so far.
+// Only conversations with real qualifying info (aggregate %, program
+// interest, budget mentioned, etc.) become a Lead row — matches the
+// explicit decision that not every WhatsApp chat should show up on the
+// Report page. Best-effort: any failure here must never affect the actual
+// customer-facing reply, which has already been sent by the time this runs.
+const VALID_INTEREST_LEVELS = ['Hot', 'Warm', 'Cold', 'Not Eligible'];
+const VALID_ELIGIBILITY = ['Eligible', 'Not Eligible'];
+const VALID_BUDGET = ['Full Payment', 'Installments'];
+const VALID_CONCERNS = ['Fee', 'Transport', 'Program', 'Location', 'Hostels', 'Other'];
+
+function parseLeadExtraction(raw) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null; // malformed JSON — never guess, just skip this conversation
+  }
+  if (!parsed || parsed.has_qualifying_info !== true) return null;
+
+  const interestLevel = VALID_INTEREST_LEVELS.includes(parsed.interest_level) ? parsed.interest_level : null;
+  const admissionEligibility = VALID_ELIGIBILITY.includes(parsed.admission_eligibility) ? parsed.admission_eligibility : null;
+  const budget = VALID_BUDGET.includes(parsed.budget) ? parsed.budget : null;
+  const programInterest = typeof parsed.program_interest === 'string' && parsed.program_interest.trim()
+    ? parsed.program_interest.trim() : null;
+  const email = typeof parsed.email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(parsed.email.trim())
+    ? parsed.email.trim() : null;
+  const keyConcerns = Array.isArray(parsed.key_concerns)
+    ? parsed.key_concerns.filter(c => VALID_CONCERNS.includes(c)).join(', ')
+    : null;
+
+  return { interestLevel, admissionEligibility, budget, programInterest, email, keyConcerns: keyConcerns || null };
+}
+
+const LEAD_EXTRACTION_PROMPT = `You are reading a WhatsApp conversation between a prospective student and a university admissions bot. Decide whether this conversation contains real qualifying information worth tracking as a lead — NOT every conversation qualifies, only ones where the student actually engaged with specifics (mentioned their academic aggregate/grades, asked about a specific program, discussed budget/payment preference, or gave contact details beyond just saying hello).
+
+Respond ONLY with a JSON object:
+{
+  "has_qualifying_info": true or false,
+  "interest_level": one of ["Hot", "Warm", "Cold", "Not Eligible"] or null,
+  "admission_eligibility": one of ["Eligible", "Not Eligible"] or null,
+  "budget": one of ["Full Payment", "Installments"] or null,
+  "program_interest": the specific program they asked about, or null,
+  "email": their email address if they gave one in the conversation, or null,
+  "key_concerns": array of any that apply from ["Fee", "Transport", "Program", "Location", "Hostels", "Other"]
+}
+"interest_level" guidance: "Hot" = gave a strong aggregate/expressed clear intent to apply; "Warm" = engaged and asked real questions but hasn't committed; "Cold" = asked one thing and went quiet; "Not Eligible" = their stated background/aggregate clearly doesn't meet admission requirements discussed in the conversation.
+If has_qualifying_info is false, all other fields must be null.`;
+
+async function extractLeadSignals(user, ticket) {
+  try {
+    const messages = await prisma.message.findMany({
+      where: { ticketId: ticket.id },
+      orderBy: { createdAt: 'asc' },
+    });
+    if (messages.length === 0) return;
+
+    const transcript = messages
+      .map(m => `${m.direction === 'outbound' ? 'Bot' : 'Customer'}: ${m.content}`)
+      .join('\n');
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: LEAD_EXTRACTION_PROMPT },
+        { role: 'user', content: transcript },
+      ],
+    });
+
+    const extracted = parseLeadExtraction(response.choices[0]?.message?.content || '');
+    if (!extracted) return; // not a qualifying conversation — no Lead row
+
+    // Upsert on ticketId (1 lead per conversation). AI-populated fields are
+    // always refreshed as the conversation develops; human-editable fields
+    // (callStatus, reasons, leadStatus, handledBy, otherNotes) are
+    // deliberately NEVER touched here — only ever set by a person, through
+    // the PATCH endpoint below.
+    await prisma.lead.upsert({
+      where: { ticketId: ticket.id },
+      update: {
+        name: ticket.customerName || 'Unknown',
+        phone: ticket.phoneNumber || ticket.threadId || null,
+        ...extracted,
+      },
+      create: {
+        userId: user.id,
+        ticketId: ticket.id,
+        name: ticket.customerName || 'Unknown',
+        phone: ticket.phoneNumber || ticket.threadId || null,
+        ...extracted,
+      },
+    });
+  } catch (err) {
+    console.error(`[LeadExtraction] Failed for ticket ${ticket.id}:`, err.message);
+    // Never throw — this must not affect the reply that was already sent.
   }
 }
 
