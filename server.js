@@ -1395,8 +1395,19 @@ app.get('/api/tickets/insights', authenticateToken, async (req, res) => {
 // GET — list all leads for this account, most recent first
 app.get('/api/leads', authenticateToken, async (req, res) => {
   try {
+    // Same ?days= pattern as /api/tickets/stats — defaults to the last 30
+    // days so this page doesn't just grow into one giant, ever-expanding
+    // list forever. Filtered on createdAt (when the lead was first
+    // qualified), not updatedAt — a lead someone's still actively working
+    // on shouldn't disappear from a "last 30 days" view just because it
+    // was touched again recently; it should disappear once the original
+    // conversation itself is old, same logic as everywhere else that uses
+    // this pattern.
+    const days = parseInt(req.query.days) || 30;
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
     const leads = await prisma.lead.findMany({
-      where: { userId: req.user.userId },
+      where: { userId: req.user.userId, createdAt: { gte: since } },
       orderBy: { updatedAt: 'desc' },
     });
     res.json(leads);
