@@ -45,6 +45,7 @@ model User {
   chatSessions          ChatSession[]
   documentChunks        DocumentChunk[]
   tickets               Ticket[]
+  leads                 Lead[]
 }
 
 model DocumentChunk {
@@ -82,6 +83,7 @@ model Ticket {
   escalationReason String?
   Message          Message[]
   user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lead             Lead?
 
   @@unique([userId, externalId])
   @@unique([userId, channel, threadId])
@@ -129,4 +131,40 @@ model Message {
 
   @@unique([ticketId, externalId])
   @@index([ticketId, createdAt])
+}
+
+// One row per WhatsApp conversation that reached real qualifying
+// information (aggregate %, program interest, budget, etc.) — NOT one row
+// per conversation. Ticket relation is 1:1 (@unique on ticketId) since a
+// lead is derived from a single conversation, not spread across several.
+model Lead {
+  id                   String   @id @default(uuid())
+  userId               String
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ticketId             String   @unique
+  ticket               Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  // AI-populated from the conversation — never edited by hand
+  name                 String
+  phone                String?
+  email                String?
+  interestLevel        String?
+  admissionEligibility String?
+  budget               String?
+  programInterest      String?
+  keyConcerns          String?
+
+  // Human-editable workflow fields
+  callStatus           String?
+  reasons              String?
+  leadStatus           String   @default("New")
+  handledBy            String?
+  otherNotes           String?
+
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@index([userId])
+  @@index([userId, interestLevel])
+  @@index([userId, leadStatus])
 }
