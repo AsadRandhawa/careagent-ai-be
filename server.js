@@ -2205,6 +2205,11 @@ function parseLeadExtraction(raw) {
 
 const LEAD_EXTRACTION_PROMPT = `You are reading a WhatsApp conversation between a prospective student and a university admissions bot. Decide whether this conversation contains real qualifying information worth tracking as a lead — NOT every conversation qualifies, only ones where the student actually engaged with specifics (mentioned their academic aggregate/grades, asked about a specific program, discussed budget/payment preference, or gave contact details beyond just saying hello).
 
+CRITICAL — DO NOT INFER OR GUESS ANY FIELD: every field below must be set ONLY when the customer (or the bot, confirming something the customer actually stated) explicitly said it in this transcript. If it wasn't actually said, the field is null — never fill it in with a plausible-sounding default. This has gone wrong before: a customer said only "I have 75% aggregate" — nothing about payment preference, and nothing confirming they met need-based/orphan/early-admission criteria — yet extraction incorrectly set "budget": "Installments" (never mentioned at all) and "admission_eligibility": "Eligible" (the bot itself had only computed a tentative discount off an unconfirmed circumstance, not a confirmed eligibility determination). Do not repeat this. Specifically:
+- "budget": only set this if the customer explicitly said they want to pay in full or in installments. A discount or fee being discussed is NOT the same as a stated payment preference.
+- "admission_eligibility": only set "Eligible" or "Not Eligible" if the bot gave the customer a clear, confirmed determination in the transcript — not a tentative or conditional calculation, not an assumption based on an aggregate alone without the actual qualifying circumstance being confirmed.
+- "interest_level" and "program_interest" follow the same rule — base these only on what was actually said, not on what seems likely.
+
 Respond ONLY with a JSON object:
 {
   "has_qualifying_info": true or false,
