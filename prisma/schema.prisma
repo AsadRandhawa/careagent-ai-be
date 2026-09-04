@@ -41,6 +41,7 @@ model User {
   instagramBusinessId   String?
   instagramConnected    Boolean         @default(false)
   instagramEnabled      Boolean         @default(true)
+  instagramAutoSend     Boolean         @default(false)
   instagramUsername     String?
   chatSessions          ChatSession[]
   documentChunks        DocumentChunk[]
