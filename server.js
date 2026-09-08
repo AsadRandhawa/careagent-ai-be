@@ -2313,7 +2313,12 @@ async function tryAutoReplyInstagramNative(user, ticket, currentMessageText) {
       }
     );
     if (!sendRes.ok) {
-      console.error(`[Instagram AutoReply] Send failed for ticket ${ticket.id} — leaving for human review.`);
+      const errBody = await sendRes.json().catch(() => null);
+      const metaError = errBody?.error;
+      console.error(
+        `[Instagram AutoReply] Send failed for ticket ${ticket.id} — leaving for human review. ` +
+        `Status: ${sendRes.status}. Meta error: ${metaError ? JSON.stringify(metaError) : '(no JSON body)'}`
+      );
       return;
     }
     const sendData = await sendRes.json().catch(() => ({}));
