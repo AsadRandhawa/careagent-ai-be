@@ -16,6 +16,15 @@ model User {
   documents             Json?           @default("[]")
   businessIdentity      String?
   brandVoice            String?
+  // Account-specific addendum injected into generateNativeDraft()'s system
+  // prompt, appended after businessIdentity/brandVoice and before KB
+  // snippets. Used for accounts that need custom business rules beyond
+  // generic RAG — e.g. Lahore Leads University's fee/scholarship tier
+  // logic and anti-hallucination guardrails, ported from the separate
+  // leads-chatbot Python service's rag.py as part of retiring that
+  // service (see Option A knowledge-base unification). Null/empty for
+  // every other account — no behavior change for anyone else.
+  nativeRagPromptAddendum String?        @db.Text
   googleTokens          Json?
   createdAt             DateTime        @default(now())
   updatedAt             DateTime        @updatedAt
@@ -56,6 +65,15 @@ model DocumentChunk {
   content   String
   embedding Unsupported("vector")
   createdAt DateTime              @default(now())
+  // Optional regex (as a string, matched case-insensitively) — when set,
+  // this chunk is force-included whenever the raw customer message
+  // matches, regardless of similarity ranking. Ports the curated-fact
+  // mechanism from leads-chatbot's rag.py/curated_facts.py: some
+  // high-value single facts (address, director's name, hostel contact)
+  // kept losing the similarity race against larger, noisier pages —
+  // rather than rely purely on ranking, force-include them by keyword.
+  // Null for ordinary chunks — no behavior change for anyone else.
+  triggerPattern String?
   user      User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
