@@ -1417,13 +1417,26 @@ ${customInstructions ? `Additional instructions for this draft (from the agent, 
   let finalStatus = draftObj.status === 'escalated' ? 'escalated' : 'draft';
   let finalReason = draftObj.reason;
   if (finalStatus === 'draft' && hasUsableDraft) {
-    const tuitionMatch = draftObj.draft.match(/tuition\s*fee[^:\n]*:\s*\*{0,2}([\d,]{4,})\s*PKR/i);
-    if (tuitionMatch) {
-      const statedFigure = tuitionMatch[1];
+    // Only check BASE tuition statements ("Tuition Fee (per semester): X
+    // PKR") — skip anything qualified as discounted/computed ("Discounted
+    // Tuition Fee (after 75% off): X PKR"), since a legitimately-computed
+    // discounted figure never appears verbatim in KB text by definition
+    // and would always fail this check. Confirmed as a real false
+    // positive live: a correctly-computed 75%-off figure (25,000 from a
+    // real 100,000 base) got wrongly escalated before this fix.
+    const tuitionMatches = [...draftObj.draft.matchAll(/tuition\s*fee([^:\n]*):\s*\*{0,2}([\d,]{4,})\s*PKR/gi)];
+    for (const m of tuitionMatches) {
+      const qualifier = (m[1] || '').toLowerCase();
+      const precedingContext = draftObj.draft.slice(Math.max(0, m.index - 20), m.index).toLowerCase();
+      const isDiscountedOrComputed = /discount|after|off|revised/.test(qualifier) || /discount/.test(precedingContext);
+      if (isDiscountedOrComputed) continue;
+
+      const statedFigure = m[2];
       if (!kbSnippets.includes(statedFigure)) {
-        console.error(`[Grounding Check] Stated tuition figure "${statedFigure} PKR" not found in retrieved KB content — escalating instead of sending. Draft: ${draftObj.draft.slice(0, 200)}`);
+        console.error(`[Grounding Check] Stated base tuition figure "${statedFigure} PKR" not found in retrieved KB content — escalating instead of sending. Draft: ${draftObj.draft.slice(0, 200)}`);
         finalStatus = 'escalated';
         finalReason = 'AI stated a fee figure that could not be verified against the retrieved knowledge base for this specific program — flagged for human review rather than risking an incorrect number.';
+        break;
       }
     }
   }
