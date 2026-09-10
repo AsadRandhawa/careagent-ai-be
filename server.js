@@ -1433,21 +1433,19 @@ ${customInstructions ? `Additional instructions for this draft (from the agent, 
 
       const statedFigure = m[2];
       if (!kbSnippets.includes(statedFigure)) {
-        // TEMPORARILY LOG-ONLY, NOT BLOCKING: two consecutive real-world
-        // triggers of this check were false positives (a correctly-
-        // computed discount, then a genuinely-correct base figure) — with
-        // zero confirmed true positives since the underlying fixes. Real
-        // students got silent non-answers because of it, which is worse
-        // than the unconfirmed risk this guards against. Logging loudly
-        // so we can see the actual retrieved content and fix the real
-        // bug in this check, without blocking real traffic in the
-        // meantime. Re-enable the `finalStatus = 'escalated'` override
-        // below once the false-positive cause is understood and fixed.
-        console.error(`[Grounding Check] Stated base tuition figure "${statedFigure} PKR" not found in retrieved KB content — NOT blocking send (log-only while debugging false positives).`);
+        // Re-enabled after adding curated facts (see
+        // migrate-leads-curated-facts.js: BSCS/BBA/ADP 1st Semester Full
+        // Fee Breakdown) that force-include the correct figure whenever
+        // the program name is mentioned — the actual root cause of the
+        // false positives was unreliable similarity retrieval (curriculum
+        // content was outranking the fee table on these pages), not a
+        // flaw in this check itself. With guaranteed retrieval in place,
+        // a failure here now means something genuinely wrong.
+        console.error(`[Grounding Check] Stated base tuition figure "${statedFigure} PKR" not found in retrieved KB content — escalating instead of sending.`);
         console.error(`[Grounding Check] Draft: ${draftObj.draft.slice(0, 300)}`);
         console.error(`[Grounding Check] Retrieved kbSnippets (first 3000 chars): ${kbSnippets.slice(0, 3000)}`);
-        // finalStatus = 'escalated';
-        // finalReason = 'AI stated a fee figure that could not be verified against the retrieved knowledge base for this specific program — flagged for human review rather than risking an incorrect number.';
+        finalStatus = 'escalated';
+        finalReason = 'AI stated a fee figure that could not be verified against the retrieved knowledge base for this specific program — flagged for human review rather than risking an incorrect number.';
         break;
       }
     }
