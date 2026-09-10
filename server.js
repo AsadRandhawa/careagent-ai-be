@@ -104,6 +104,14 @@ const EXTERNAL_RAG_MAP = {
   '0437029b-c10b-4451-bafb-7992769ddb48': { // admissions@leads.edu.pk
     baseUrl: 'https://leads-islamabad-chatbot-production.up.railway.app',
     secretEnvVar: 'LEADS_ISLAMABAD_RAG_SECRET',
+    // Parallel-run flag: when true, generateNativeDraft() also runs
+    // silently alongside every real message (see
+    // logNativeShadowComparison below), logging native-vs-Python answers
+    // side by side for comparison. Never sent to the customer, never
+    // affects ticket status — purely observational, to build confidence
+    // in the ported nativeRagPromptAddendum before ever switching this
+    // account's actual auto-send over to the native path.
+    shadowNativeCompare: true,
   },
 };
 
@@ -2244,6 +2252,14 @@ async function tryAutoReplyViaExternalRag(user, ticket, currentMessageText) {
 
     await sendWhatsAppMessage(user, ticket, ragData.answer, 'AI (auto-reply)');
 
+    // Parallel-run comparison — see EXTERNAL_RAG_MAP's shadowNativeCompare
+    // comment. Deliberately NOT awaited: this must never add latency to
+    // the real customer-facing send above, and never throw into this
+    // function's flow (logNativeShadowComparison already self-catches).
+    if (config.shadowNativeCompare) {
+      logNativeShadowComparison(user, ticket, currentMessageText, ragData.answer);
+    }
+
     if (ragData.needs_followup) {
       await prisma.ticket.update({
         where: { id: ticket.id },
@@ -2263,6 +2279,37 @@ async function tryAutoReplyViaExternalRag(user, ticket, currentMessageText) {
     // fail closed. The ticket stays exactly as a normal new inbound
     // message; nothing was sent, nothing was marked resolved/escalated.
     console.error(`[ExternalRAG] Auto-reply failed for ticket ${ticket.id}, leaving for human review:`, err.message);
+  }
+}
+
+// Parallel-run comparison for the WhatsApp -> native RAG migration (see
+// EXTERNAL_RAG_MAP's shadowNativeCompare flag). Runs generateNativeDraft()
+// with the exact same question the external service just answered, and
+// logs both side by side. Deliberately does NOT touch the ticket, does
+// NOT send anything, and NEVER throws into its caller — this is pure
+// observation, run fire-and-forget so it can never add latency or risk
+// to the real customer-facing send. Once enough of these logs show the
+// native answer matching/improving on the external one across real
+// traffic, that's the actual go/no-go signal for cutting WhatsApp over —
+// not just the manual test suite, which only covers cases we thought to
+// ask.
+async function logNativeShadowComparison(user, ticket, currentMessageText, externalAnswer) {
+  try {
+    const nativeResult = await generateNativeDraft(user.id, {
+      customerName: ticket.customerName,
+      messageText: currentMessageText,
+      channel: 'whatsapp',
+    });
+    console.log(
+      `[NativeRAG Shadow] Ticket ${ticket.id}\n` +
+      `  Question: ${currentMessageText}\n` +
+      `  External (LIVE, sent to customer): ${externalAnswer}\n` +
+      `  Native   (shadow, not sent): [${nativeResult.status}] ${nativeResult.draft}`
+    );
+  } catch (err) {
+    // Shadow-mode failure is never customer-visible and never worth
+    // interrupting anything for — just log and move on.
+    console.error(`[NativeRAG Shadow] Failed for ticket ${ticket.id}:`, err.message);
   }
 }
 
