@@ -1400,10 +1400,38 @@ ${customInstructions ? `Additional instructions for this draft (from the agent, 
   const urgencyNum = Number(draftObj.urgency);
   const urgency = Number.isInteger(urgencyNum) ? Math.min(5, Math.max(1, urgencyNum)) : 1;
 
+  // ── Fee-figure grounding check ──────────────────────────────────────────
+  // Prompt instructions alone ("never reuse a number from a different
+  // program", "verify it's in retrieved content") were added twice and
+  // still failed — confirmed live: a customer asking about BBA got BSCS's
+  // exact tuition figure (120,000) copied straight out of conversation
+  // history, even with those instructions in place. This is a code-level
+  // backstop, not a prompt tweak: the stated "Tuition Fee (per semester)"
+  // figure must literally appear in the KB content actually retrieved for
+  // THIS specific request — if it doesn't, that's a strong signal the
+  // number came from history/hallucination rather than real retrieval,
+  // and it's safer to escalate to a human than risk sending a wrong fee
+  // to a real student. Only checks the base per-semester tuition figure
+  // (not discounted/computed totals, which legitimately won't appear
+  // verbatim in KB text since they're valid arithmetic on a real number).
+  let finalStatus = draftObj.status === 'escalated' ? 'escalated' : 'draft';
+  let finalReason = draftObj.reason;
+  if (finalStatus === 'draft' && hasUsableDraft) {
+    const tuitionMatch = draftObj.draft.match(/tuition\s*fee[^:\n]*:\s*\*{0,2}([\d,]{4,})\s*PKR/i);
+    if (tuitionMatch) {
+      const statedFigure = tuitionMatch[1];
+      if (!kbSnippets.includes(statedFigure)) {
+        console.error(`[Grounding Check] Stated tuition figure "${statedFigure} PKR" not found in retrieved KB content — escalating instead of sending. Draft: ${draftObj.draft.slice(0, 200)}`);
+        finalStatus = 'escalated';
+        finalReason = 'AI stated a fee figure that could not be verified against the retrieved knowledge base for this specific program — flagged for human review rather than risking an incorrect number.';
+      }
+    }
+  }
+
   return {
-    status: draftObj.status === 'escalated' ? 'escalated' : 'draft',
+    status: finalStatus,
     draft: draftObj.draft,
-    reason: draftObj.reason,
+    reason: finalReason,
     category, sentiment, urgency,
   };
 }
