@@ -310,6 +310,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
         lastSeenInboxAt: true, lastSeenEscalAt: true,
         facebookConnected: true, facebookPageName: true, facebookEnabled: true,
         instagramConnected: true, instagramUsername: true, instagramEnabled: true, instagramAutoSend: true,
+        livechatAutoSend: true,
         whatsappToken: true, whatsappPhoneNumberId: true, whatsappWabaId: true,
       }
     });
@@ -326,6 +327,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
       instagramUsername:  user.instagramUsername   ?? null,
       instagramEnabled:   user.instagramEnabled    ?? true,
       instagramAutoSend:  user.instagramAutoSend   ?? false,
+      livechatAutoSend:   user.livechatAutoSend    ?? false,
       // WhatsApp is "connected" for this account if either: (a) they went
       // through Embedded Signup and have their own token/number stored, or
       // (b) they're the single-tenant fallback account configured via env
@@ -384,12 +386,13 @@ app.patch('/api/user/preferences', authenticateToken, async (req, res) => {
   try {
     const { gmailEnabled, lastSeenInboxAt, lastSeenEscalAt,
             aiAutoDrafting, autoClassification, sentimentTracking, facebookEnabled, instagramEnabled,
-            instagramAutoSend } = req.body;
+            instagramAutoSend, livechatAutoSend } = req.body;
     const data = {};
     if (gmailEnabled          !== undefined) data.gmailEnabled          = gmailEnabled;
     if (facebookEnabled       !== undefined) data.facebookEnabled       = facebookEnabled;
     if (instagramEnabled      !== undefined) data.instagramEnabled      = instagramEnabled;
     if (instagramAutoSend     !== undefined) data.instagramAutoSend     = instagramAutoSend;
+    if (livechatAutoSend      !== undefined) data.livechatAutoSend      = livechatAutoSend;
     if (aiAutoDrafting        !== undefined) data.aiAutoDrafting        = aiAutoDrafting;
     if (autoClassification    !== undefined) data.autoClassification    = autoClassification;
     if (sentimentTracking     !== undefined) data.sentimentTracking     = sentimentTracking;
@@ -2313,6 +2316,57 @@ async function logNativeShadowComparison(user, ticket, currentMessageText, exter
   }
 }
 
+// ── Website Live Chat autonomous reply (opt-in per account) ─────────────────
+// First AI auto-reply capability Website Live Chat has ever had — every
+// other part of this file's handling of ChatSession/ChatMessage has always
+// been human-typed-reply only (see the known architectural split between
+// Ticket/Message and ChatSession/ChatMessage). Mirrors
+// tryAutoReplyInstagramNative's pattern exactly: generateNativeDraft's
+// "draft" sends automatically, "escalated" holds for a human — but the
+// "send" here is just writing a ChatMessage directly (no external API),
+// since the widget already polls for role==='agent' messages.
+//
+// Off by default (User.livechatAutoSend) — same reasoning as Instagram:
+// don't trust any account's AI unsupervised until it's been observed
+// against that account's real knowledge base first.
+async function tryAutoReplyWebsiteNative(user, session, currentMessageText) {
+  if (!user.livechatAutoSend) return;
+
+  try {
+    const result = await generateNativeDraft(user.id, {
+      customerName: session.visitorName,
+      messageText: currentMessageText,
+      channel: 'website',
+    });
+
+    if (result.status === 'escalated') {
+      await prisma.chatSession.update({
+        where: { id: session.id },
+        data: {
+          escalated: true,
+          escalationReason: result.reason || 'AI could not confidently answer — flagged for human follow-up.',
+        },
+      });
+      return;
+    }
+
+    await prisma.chatMessage.create({
+      data: { sessionId: session.id, role: 'agent', content: result.draft },
+    });
+    await prisma.chatSession.update({
+      where: { id: session.id },
+      data: { updatedAt: new Date() },
+    });
+  } catch (err) {
+    // Fail closed, same as every other auto-reply path in this file: never
+    // throw into the caller, never leave the session in a broken state —
+    // worst case, the visitor's message just sits for a human to answer
+    // through the normal /api/livechat/reply flow.
+    console.error(`[Livechat AutoReply] Failed for session ${session.id}:`, err.message);
+  }
+}
+
+
 // ── Lead extraction for the Report page ─────────────────────────────────────
 // Runs AFTER a WhatsApp auto-reply, reading the full conversation so far.
 // Only conversations with real qualifying info (aggregate %, program
@@ -2865,10 +2919,15 @@ app.post('/api/livechat/message', async (req, res) => {
   try {
     const { sessionId, content } = req.body;
     if (!sessionId || !content?.trim()) return res.status(400).json({ error: 'sessionId and content required' });
-    const session = await prisma.chatSession.findUnique({ where: { id: sessionId } });
+    const session = await prisma.chatSession.findUnique({ where: { id: sessionId }, include: { user: true } });
     if (!session) return res.status(404).json({ error: 'Session not found' });
     const message = await prisma.chatMessage.create({ data: { sessionId, role: 'visitor', content: content.trim() } });
     await prisma.chatSession.update({ where: { id: sessionId }, data: { updatedAt: new Date() } });
+
+    // Fire-and-forget: never let a slow/failed AI reply delay or break the
+    // visitor's own message being saved and acknowledged above.
+    tryAutoReplyWebsiteNative(session.user, session, content.trim());
+
     res.json({ message });
   } catch (err) {
     console.error('[livechat/message]', err.message);
@@ -2910,7 +2969,8 @@ app.get('/api/livechat/tickets', authenticateToken, async (req, res) => {
       content:      s.messages[0]?.content || 'Started a chat',
       time:         new Date(s.updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       createdAt:    s.createdAt.toISOString(),
-      status:       'new',
+      status:       s.escalated ? 'escalated' : 'new',
+      escalationReason: s.escalationReason || null,
       hasDraft:     true,
       avatarVariant: 'teal',
       channel:      'website',
@@ -2950,6 +3010,11 @@ app.post('/api/livechat/reply', authenticateToken, requireIdempotencyKey, async 
     });
     if (!session) return res.status(404).json({ error: 'Session not found' });
     const message = await prisma.chatMessage.create({ data: { sessionId, role: 'agent', content: content.trim() } });
+    // A human reply is the resolution to whatever the AI couldn't handle —
+    // clear the flag so this doesn't stay stuck showing as escalated.
+    if (session.escalated) {
+      await prisma.chatSession.update({ where: { id: sessionId }, data: { escalated: false, escalationReason: null } });
+    }
     res.json({ success: true, message });
   } catch (err) {
     console.error('[livechat/reply]', err.message);
