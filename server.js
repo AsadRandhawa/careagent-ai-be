@@ -83,37 +83,16 @@ const authLimiter = rateLimit({
 
 const prisma = new PrismaClient();
 
-// ── External RAG routing (per-account override) ─────────────────────────────
-// Certain WhatsApp accounts run their own purpose-built RAG/chatbot service
-// instead of CareAgent's native OpenAI+pgvector pipeline — e.g. Lahore Leads
-// University's admissions bot, which has its own knowledge base and
-// lead-qualification behavior baked into its own prompt. Keyed by CareAgent
-// userId (not channel/global), since this is specific to individual accounts
-// that have their own external service, not a platform-wide setting.
-//
-// AUTO-SEND: accounts listed here bypass the normal human-drafts/agent-
-// approves flow entirely for WhatsApp — the external service's answer is
-// sent back automatically the moment a message arrives. This is a real,
-// deliberate behavior change from every other channel/account, where a
-// human always reviews before anything sends. Only turn this on for an
-// account once its external service's own escalation/fallback behavior is
-// trustworthy — there is no CareAgent-side review step catching a bad
-// answer before the customer sees it, only the external service's own
-// needs_followup signal, escalating AFTER the fact.
-const EXTERNAL_RAG_MAP = {
-  '0437029b-c10b-4451-bafb-7992769ddb48': { // admissions@leads.edu.pk
-    baseUrl: 'https://leads-islamabad-chatbot-production.up.railway.app',
-    secretEnvVar: 'LEADS_ISLAMABAD_RAG_SECRET',
-    // Parallel-run flag: when true, generateNativeDraft() also runs
-    // silently alongside every real message (see
-    // logNativeShadowComparison below), logging native-vs-Python answers
-    // side by side for comparison. Never sent to the customer, never
-    // affects ticket status — purely observational, to build confidence
-    // in the ported nativeRagPromptAddendum before ever switching this
-    // account's actual auto-send over to the native path.
-    shadowNativeCompare: true,
-  },
-};
+// ── (removed) External RAG routing ──────────────────────────────────────────
+// Lahore Leads University's WhatsApp account used to route through a
+// separate Python leads-chatbot service (its own RAG/vector DB, its own
+// business-rule prompt in rag.py). That logic has been fully ported into
+// generateNativeDraft() via User.nativeRagPromptAddendum + curated-fact
+// DocumentChunk rows (see migrate-leads-curated-facts.js and
+// migrate-leads-scraped-pages.js), validated in shadow-mode against real
+// traffic, and this account has been cut over to tryAutoReplyWhatsAppNative()
+// below — the same native path already used for Instagram and Website Live
+// Chat. The Python service is no longer called from anywhere in this file.
 
 const openai = new OpenAI({
   apiKey: process.env.VITE_OPENAI_API_KEY || process.env.OPENAI_API_KEY
@@ -310,7 +289,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
         lastSeenInboxAt: true, lastSeenEscalAt: true,
         facebookConnected: true, facebookPageName: true, facebookEnabled: true,
         instagramConnected: true, instagramUsername: true, instagramEnabled: true, instagramAutoSend: true,
-        livechatAutoSend: true,
+        livechatAutoSend: true, whatsappAutoSend: true,
         whatsappToken: true, whatsappPhoneNumberId: true, whatsappWabaId: true,
       }
     });
@@ -328,6 +307,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
       instagramEnabled:   user.instagramEnabled    ?? true,
       instagramAutoSend:  user.instagramAutoSend   ?? false,
       livechatAutoSend:   user.livechatAutoSend    ?? false,
+      whatsappAutoSend:   user.whatsappAutoSend    ?? false,
       // WhatsApp is "connected" for this account if either: (a) they went
       // through Embedded Signup and have their own token/number stored, or
       // (b) they're the single-tenant fallback account configured via env
@@ -386,13 +366,14 @@ app.patch('/api/user/preferences', authenticateToken, async (req, res) => {
   try {
     const { gmailEnabled, lastSeenInboxAt, lastSeenEscalAt,
             aiAutoDrafting, autoClassification, sentimentTracking, facebookEnabled, instagramEnabled,
-            instagramAutoSend, livechatAutoSend } = req.body;
+            instagramAutoSend, livechatAutoSend, whatsappAutoSend } = req.body;
     const data = {};
     if (gmailEnabled          !== undefined) data.gmailEnabled          = gmailEnabled;
     if (facebookEnabled       !== undefined) data.facebookEnabled       = facebookEnabled;
     if (instagramEnabled      !== undefined) data.instagramEnabled      = instagramEnabled;
     if (instagramAutoSend     !== undefined) data.instagramAutoSend     = instagramAutoSend;
     if (livechatAutoSend      !== undefined) data.livechatAutoSend      = livechatAutoSend;
+    if (whatsappAutoSend      !== undefined) data.whatsappAutoSend      = whatsappAutoSend;
     if (aiAutoDrafting        !== undefined) data.aiAutoDrafting        = aiAutoDrafting;
     if (autoClassification    !== undefined) data.autoClassification    = autoClassification;
     if (sentimentTracking     !== undefined) data.sentimentTracking     = sentimentTracking;
@@ -2096,7 +2077,7 @@ app.post('/api/whatsapp/webhook', async (req, res) => {
           await recordMessage(ticket, {
             direction: 'inbound', externalId: msg.id, content: text, senderName: customerName, at: receivedAt,
           });
-          await tryAutoReplyViaExternalRag(user, ticket, text);
+          await tryAutoReplyWhatsAppNative(user, ticket, text);
           await extractLeadSignals(user, ticket);
         }
       }
@@ -2195,124 +2176,59 @@ async function sendWhatsAppMessage(user, ticket, text, senderName = 'Agent') {
   return sentId;
 }
 
-// ── Autonomous reply via an account's external RAG service ─────────────────
-// Checks EXTERNAL_RAG_MAP for this account and, if configured, gets an
-// answer and sends it back immediately — no human review step. This
-// function must NEVER throw and must NEVER leave the ticket in a broken
-// state: any failure (missing secret, network error, timeout, bad
-// response shape) simply returns without sending anything, leaving the
-// ticket exactly as a normal new inbound message for a human to handle
-// through the regular Inbox draft/approve flow. Silent-degrade-to-human,
-// never silent-degrade-to-nothing.
-const EXTERNAL_RAG_TIMEOUT_MS = 20000;
-
-async function tryAutoReplyViaExternalRag(user, ticket, currentMessageText) {
-  const config = EXTERNAL_RAG_MAP[user.id];
-  if (!config) return; // this account doesn't use an external RAG service
-
-  const secret = process.env[config.secretEnvVar];
-  if (!secret) {
-    console.error(`[ExternalRAG] ${config.secretEnvVar} is not set — skipping auto-reply for user ${user.id}, leaving for human review.`);
-    return;
-  }
+// ── WhatsApp autonomous reply (opt-in per account) ──────────────────────────
+// Uses CareAgent's own native RAG (generateNativeDraft, shared with
+// /api/ai/draft, Instagram, and Website Live Chat) — same "draft" sends
+// automatically / "escalated" holds for a human pattern as the other two
+// native auto-reply functions. This replaced the old external-RAG-service
+// routing (see the removed-block comment above) once Lahore Leads
+// University's Python bot logic was fully ported into
+// nativeRagPromptAddendum + migrated DocumentChunk content, and validated
+// in shadow-mode against real traffic before cutover.
+//
+// Off by default (User.whatsappAutoSend) — same reasoning as Instagram and
+// Website Live Chat: don't trust any account's AI unsupervised until it's
+// been observed against that account's real knowledge base first.
+async function tryAutoReplyWhatsAppNative(user, ticket, currentMessageText) {
+  if (!user.whatsappAutoSend) return;
 
   try {
-    // Build conversation history from everything recorded on this ticket
-    // BEFORE the current message (which was just recorded by the caller) —
-    // the external service wants the current question passed separately
-    // via `message`, not folded into `history`.
-    const priorMessages = await prisma.message.findMany({
-      where: { ticketId: ticket.id },
-      orderBy: { createdAt: 'asc' },
-    });
-    const history = priorMessages
-      .slice(0, -1)
-      .map(m => ({ role: m.direction === 'outbound' ? 'assistant' : 'user', content: m.content }));
-
-    const controller = new AbortController();
-    const timeoutHandle = setTimeout(() => controller.abort(), EXTERNAL_RAG_TIMEOUT_MS);
-    let ragRes;
-    try {
-      ragRes = await fetch(`${config.baseUrl}/partner/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-CareAgent-Secret': secret },
-        body: JSON.stringify({ message: currentMessageText, history }),
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(timeoutHandle);
-    }
-
-    if (!ragRes.ok) {
-      console.error(`[ExternalRAG] ${config.baseUrl} returned HTTP ${ragRes.status} for ticket ${ticket.id} — leaving for human review.`);
-      return;
-    }
-    const ragData = await ragRes.json().catch(() => null);
-    if (!ragData || typeof ragData.answer !== 'string' || !ragData.answer.trim()) {
-      console.error(`[ExternalRAG] Malformed/empty response from ${config.baseUrl} for ticket ${ticket.id} — leaving for human review.`);
-      return;
-    }
-
-    await sendWhatsAppMessage(user, ticket, ragData.answer, 'AI (auto-reply)');
-
-    // Parallel-run comparison — see EXTERNAL_RAG_MAP's shadowNativeCompare
-    // comment. Deliberately NOT awaited: this must never add latency to
-    // the real customer-facing send above, and never throw into this
-    // function's flow (logNativeShadowComparison already self-catches).
-    if (config.shadowNativeCompare) {
-      logNativeShadowComparison(user, ticket, currentMessageText, ragData.answer);
-    }
-
-    if (ragData.needs_followup) {
-      await prisma.ticket.update({
-        where: { id: ticket.id },
-        data: {
-          status: 'escalated',
-          escalationReason: 'Auto-reply sent, but the bot flagged this question for human follow-up.',
-        },
-      });
-    } else {
-      await prisma.ticket.update({
-        where: { id: ticket.id },
-        data: { status: 'resolved', resolvedAt: new Date() },
-      });
-    }
-  } catch (err) {
-    // Network error, timeout (AbortError), or anything else unexpected —
-    // fail closed. The ticket stays exactly as a normal new inbound
-    // message; nothing was sent, nothing was marked resolved/escalated.
-    console.error(`[ExternalRAG] Auto-reply failed for ticket ${ticket.id}, leaving for human review:`, err.message);
-  }
-}
-
-// Parallel-run comparison for the WhatsApp -> native RAG migration (see
-// EXTERNAL_RAG_MAP's shadowNativeCompare flag). Runs generateNativeDraft()
-// with the exact same question the external service just answered, and
-// logs both side by side. Deliberately does NOT touch the ticket, does
-// NOT send anything, and NEVER throws into its caller — this is pure
-// observation, run fire-and-forget so it can never add latency or risk
-// to the real customer-facing send. Once enough of these logs show the
-// native answer matching/improving on the external one across real
-// traffic, that's the actual go/no-go signal for cutting WhatsApp over —
-// not just the manual test suite, which only covers cases we thought to
-// ask.
-async function logNativeShadowComparison(user, ticket, currentMessageText, externalAnswer) {
-  try {
-    const nativeResult = await generateNativeDraft(user.id, {
+    const result = await generateNativeDraft(user.id, {
       customerName: ticket.customerName,
       messageText: currentMessageText,
       channel: 'whatsapp',
     });
-    console.log(
-      `[NativeRAG Shadow] Ticket ${ticket.id}\n` +
-      `  Question: ${currentMessageText}\n` +
-      `  External (LIVE, sent to customer): ${externalAnswer}\n` +
-      `  Native   (shadow, not sent): [${nativeResult.status}] ${nativeResult.draft}`
-    );
+
+    if (result.status === 'escalated') {
+      await prisma.ticket.update({
+        where: { id: ticket.id },
+        data: {
+          status: 'escalated',
+          escalationReason: result.reason || 'AI could not confidently answer — flagged for human follow-up.',
+          sentiment: result.sentiment, category: result.category, urgency: result.urgency,
+        },
+      });
+      return;
+    }
+
+    // sendWhatsAppMessage throws on failure (missing token, Graph API
+    // error) — caught below, same fail-closed behavior as every other
+    // auto-reply path: nothing sent, ticket stays as a normal new
+    // message for a human to handle.
+    await sendWhatsAppMessage(user, ticket, result.draft, 'AI (auto-reply)');
+
+    await prisma.ticket.update({
+      where: { id: ticket.id },
+      data: {
+        status: 'resolved', resolvedAt: new Date(),
+        sentiment: result.sentiment, category: result.category, urgency: result.urgency,
+      },
+    });
   } catch (err) {
-    // Shadow-mode failure is never customer-visible and never worth
-    // interrupting anything for — just log and move on.
-    console.error(`[NativeRAG Shadow] Failed for ticket ${ticket.id}:`, err.message);
+    // Network error, send failure, or anything else unexpected — fail
+    // closed. The ticket stays exactly as a normal new inbound message;
+    // nothing was sent, nothing was marked resolved/escalated.
+    console.error(`[WhatsApp AutoReply] Failed for ticket ${ticket.id}, leaving for human review:`, err.message);
   }
 }
 
