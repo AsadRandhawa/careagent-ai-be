@@ -51,6 +51,10 @@ model User {
   instagramConnected    Boolean         @default(false)
   instagramEnabled      Boolean         @default(true)
   instagramAutoSend     Boolean         @default(false)
+  // Website Live Chat auto-send — opt-in, off by default, same pattern as
+  // instagramAutoSend. Website Live Chat has never had AI auto-reply for
+  // any account before this — see tryAutoReplyWebsiteNative().
+  livechatAutoSend      Boolean         @default(false)
   instagramUsername     String?
   chatSessions          ChatSession[]
   documentChunks        DocumentChunk[]
@@ -117,6 +121,13 @@ model ChatSession {
   visitorId   String
   visitorName String        @default("Visitor")
   status      String        @default("active")
+  // Mirrors Ticket.status === 'escalated' / escalationReason — set by
+  // tryAutoReplyWebsiteNative() when the native AI can't confidently
+  // answer. Separate boolean rather than overloading `status`, since
+  // `status` already means active/resolved (session lifecycle), not
+  // AI-confidence — a session can be active AND escalated at once.
+  escalated         Boolean  @default(false)
+  escalationReason  String?
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
   messages    ChatMessage[]
