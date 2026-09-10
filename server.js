@@ -1451,6 +1451,46 @@ ${customInstructions ? `Additional instructions for this draft (from the agent, 
     }
   }
 
+  // ── Arithmetic check: stated total must equal the sum of the 5 line items ──
+  // Independent of retrieval content entirely — pure arithmetic. Caught
+  // live: a discounted BBA answer listed correct individual line items
+  // (10,000 + 10,000 + 25,000 + 5,000 + 5,000 = 55,000) but stated the
+  // total as 50,000 — every number grounded, the addition itself just
+  // wrong. The addendum already has an explicit "add up the actual five
+  // line items, don't round or estimate" rule and it still happened, so
+  // this is a code-level backstop, same reasoning as the grounding check.
+  if (finalStatus === 'draft' && hasUsableDraft) {
+    const parseFeeLine = (label) => {
+      const re = new RegExp(`${label}\\s*fee[^:\\n]*:\\s*\\*{0,2}([\\d,]{3,})\\s*PKR`, 'i');
+      const m = draftObj.draft.match(re);
+      return m ? Number(m[1].replace(/,/g, '')) : null;
+    };
+    const admission   = parseFeeLine('admission');
+    const enrollment  = parseFeeLine('enrollment');
+    const examination = parseFeeLine('examination');
+    const library      = parseFeeLine('library');
+    // Tuition: take the LAST "...tuition fee...: X PKR" match (the
+    // discounted one, if present) — same lines already extracted above.
+    const tuitionAllMatches = [...draftObj.draft.matchAll(/tuition\s*fee[^:\n]*:\s*\*{0,2}([\d,]{3,})\s*PKR/gi)];
+    const tuition = tuitionAllMatches.length > 0
+      ? Number(tuitionAllMatches[tuitionAllMatches.length - 1][1].replace(/,/g, ''))
+      : null;
+    const totalMatches = [...draftObj.draft.matchAll(/total[^:\n]*:\s*\*{0,2}([\d,]{3,})\s*PKR/gi)];
+    const statedTotal = totalMatches.length > 0
+      ? Number(totalMatches[totalMatches.length - 1][1].replace(/,/g, ''))
+      : null;
+
+    if ([admission, enrollment, tuition, examination, library, statedTotal].every(n => n !== null)) {
+      const actualSum = admission + enrollment + tuition + examination + library;
+      if (actualSum !== statedTotal) {
+        console.error(`[Arithmetic Check] Stated total ${statedTotal} PKR does not match sum of line items ${actualSum} PKR (${admission}+${enrollment}+${tuition}+${examination}+${library}) — escalating instead of sending.`);
+        console.error(`[Arithmetic Check] Draft: ${draftObj.draft.slice(0, 300)}`);
+        finalStatus = 'escalated';
+        finalReason = `AI's stated total (${statedTotal} PKR) did not match the sum of its own line items (${actualSum} PKR) — flagged for human review rather than sending an arithmetic error.`;
+      }
+    }
+  }
+
   return {
     status: finalStatus,
     draft: draftObj.draft,
