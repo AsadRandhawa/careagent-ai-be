@@ -55,6 +55,13 @@ model User {
   // instagramAutoSend. Website Live Chat has never had AI auto-reply for
   // any account before this — see tryAutoReplyWebsiteNative().
   livechatAutoSend      Boolean         @default(false)
+  // WhatsApp auto-send — opt-in, off by default. Previously, this was
+  // implicit for whichever accounts appeared in the now-removed
+  // EXTERNAL_RAG_MAP (routing to an external Python service). Now an
+  // explicit per-account field like Instagram/Live Chat, gating
+  // tryAutoReplyWhatsAppNative() — every other WhatsApp account stays
+  // human-review-only until explicitly opted in.
+  whatsappAutoSend      Boolean         @default(false)
   instagramUsername     String?
   chatSessions          ChatSession[]
   documentChunks        DocumentChunk[]
