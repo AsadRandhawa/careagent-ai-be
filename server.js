@@ -716,10 +716,31 @@ app.get('/api/gmail/emails', authenticateToken, async (req, res) => {
 app.post('/api/tickets/dismiss', authenticateToken, async (req, res) => {
   try {
     const { ticketId, status = 'new' } = req.body;
-    await prisma.ticket.updateMany({
-      where: { userId: req.user.userId, externalId: ticketId },
+
+    // Bug fix: every ticket-list endpoint sends the frontend the internal
+    // `id` (e.g. WhatsApp's `id: t.id`), but this previously matched on
+    // `externalId` instead — a different field entirely, so the update
+    // matched zero rows every time. The dismiss appeared to work (the
+    // frontend already hid it optimistically) but never persisted,
+    // so the ticket reappeared on the next refresh. Matching on `id` now,
+    // consistent with every other id-based lookup in this file (e.g.
+    // GET /api/tickets/:id/messages above).
+    const ticketResult = await prisma.ticket.updateMany({
+      where: { userId: req.user.userId, id: ticketId },
       data: { status, escalationReason: null }
     });
+
+    // Website Live Chat escalations live on ChatSession, not Ticket — a
+    // dismiss for one of those would otherwise silently match nothing
+    // here for a second, different reason (wrong table entirely). Try
+    // ChatSession if nothing matched on Ticket.
+    if (ticketResult.count === 0) {
+      await prisma.chatSession.updateMany({
+        where: { userId: req.user.userId, id: ticketId },
+        data: { escalated: false, escalationReason: null }
+      });
+    }
+
     res.json({ success: true });
   } catch (err) {
     console.error('Dismiss error:', err.message);
