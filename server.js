@@ -1376,6 +1376,15 @@ ${customInstructions ? `Additional instructions for this draft (from the agent, 
 
   const response = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
+    // Deterministic rather than OpenAI's default (1.0) — since the same
+    // knowledge base and rules serve all 5 channels, a standalone
+    // question should get materially the same answer regardless of
+    // which channel it arrives on, not vary run-to-run from sampling
+    // randomness. Slightly less natural phrasing variety in exchange for
+    // much more consistent, predictable behavior — the right trade for a
+    // support bot quoting fees/policies, where consistency matters more
+    // than conversational flair.
+    temperature: 0,
     response_format: { type: 'json_object' },
     messages: [
       { role: 'system', content: systemPrompt },
@@ -2095,8 +2104,21 @@ app.post('/api/instagram/reply', authenticateToken, requireIdempotencyKey, async
       }
     );
     if (!sendRes.ok) {
-      const err = await sendRes.json();
-      throw new Error(err?.error?.message || 'Send failed');
+      const err = await sendRes.json().catch(() => null);
+      const metaError = err?.error;
+      // Meta code 3 / "Application does not have the capability to make
+      // this API call" specifically means the required permission
+      // (instagram_manage_messages) hasn't cleared App Review yet — not a
+      // bug in this endpoint. Surface that plainly rather than a generic
+      // "Failed to send reply", so whoever's using the Inbox understands
+      // why immediately instead of assuming something's broken.
+      if (metaError?.code === 3) {
+        throw Object.assign(
+          new Error('Instagram sending is not yet approved by Meta (instagram_manage_messages permission pending App Review) — replies cannot be sent until that clears.'),
+          { isPermissionPending: true }
+        );
+      }
+      throw new Error(metaError?.message || 'Send failed');
     }
 
     if (ticketId) {
@@ -2111,6 +2133,9 @@ app.post('/api/instagram/reply', authenticateToken, requireIdempotencyKey, async
     res.json({ success: true });
   } catch (error) {
     console.error('Instagram reply error:', error.message);
+    if (error.isPermissionPending) {
+      return res.status(503).json({ error: error.message });
+    }
     res.status(500).json({ error: 'Failed to send reply' });
   }
 });
