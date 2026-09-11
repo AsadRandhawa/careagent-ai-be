@@ -66,6 +66,11 @@ app.use(cors({
   credentials: true,
 }));
 app.use(express.json({
+  // Default 100kb is far too small for Knowledge Base document uploads —
+  // a handful of real-world pages/PDFs easily exceeds it (confirmed live:
+  // 24 scraped pages hit HTTP 413 well under 1MB combined). 10mb is
+  // generous for text-based KB content while still bounded against abuse.
+  limit: '10mb',
   verify: (req, res, buf) => { req.rawBody = buf; },
 }));
 
