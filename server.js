@@ -1986,8 +1986,22 @@ app.post('/api/facebook/reply', authenticateToken, requireIdempotencyKey, async 
       }
     );
     if (!sendRes.ok) {
-      const err = await sendRes.json();
-      throw new Error(err?.error?.message || 'Send failed');
+      const err = await sendRes.json().catch(() => null);
+      const metaError = err?.error;
+      // Meta code 10 with this specific wording means Messenger's 24-hour
+      // customer service window has closed for this conversation — this
+      // is an inherent platform policy, not a bug or a missing
+      // permission. It cannot be bypassed for a normal reply; either the
+      // customer messages again (reopening the window) or an approved
+      // message tag is used for the specific narrow cases Meta allows
+      // outside the window.
+      if (metaError?.code === 10 && /outside the allowed window/i.test(metaError?.message || '')) {
+        throw Object.assign(
+          new Error("This conversation's 24-hour Messenger reply window has closed — Meta blocks free-form replies until the customer sends a new message. This is a platform policy, not an app issue."),
+          { isWindowClosed: true }
+        );
+      }
+      throw new Error(metaError?.message || 'Send failed');
     }
 
     if (ticketId) {
@@ -2002,6 +2016,9 @@ app.post('/api/facebook/reply', authenticateToken, requireIdempotencyKey, async 
     res.json({ success: true });
   } catch (error) {
     console.error('Facebook reply error:', error.message);
+    if (error.isWindowClosed) {
+      return res.status(409).json({ error: error.message });
+    }
     res.status(500).json({ error: 'Failed to send reply' });
   }
 });
@@ -2109,12 +2126,12 @@ app.post('/api/instagram/reply', authenticateToken, requireIdempotencyKey, async
     if (!threadId || !body?.trim()) return res.status(400).json({ error: 'threadId and body required' });
 
     const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
-    if (!user?.instagramBusinessId || !user?.facebookPageToken) {
+    if (!user?.instagramBusinessId || !user?.instagramAccessToken) {
       return res.status(400).json({ error: 'Instagram not connected' });
     }
 
     const sendRes = await fetch(
-      `https://graph.facebook.com/v19.0/${user.instagramBusinessId}/messages?access_token=${user.facebookPageToken}`,
+      `https://graph.facebook.com/v19.0/${user.instagramBusinessId}/messages?access_token=${user.instagramAccessToken}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2570,7 +2587,7 @@ If has_qualifying_info is false, all other fields must be null.`;
 // caught a real hallucination bug on WhatsApp before it caused harm.
 async function tryAutoReplyInstagramNative(user, ticket, currentMessageText) {
   if (!user.instagramAutoSend) return;
-  if (!user.instagramBusinessId || !user.facebookPageToken) return;
+  if (!user.instagramBusinessId || !user.instagramAccessToken) return;
 
   try {
     // Same history-building fix as WhatsApp/Website — without this, every
@@ -2603,7 +2620,7 @@ async function tryAutoReplyInstagramNative(user, ticket, currentMessageText) {
     }
 
     const sendRes = await fetch(
-      `https://graph.facebook.com/v19.0/${user.instagramBusinessId}/messages?access_token=${user.facebookPageToken}`,
+      `https://graph.facebook.com/v19.0/${user.instagramBusinessId}/messages?access_token=${user.instagramAccessToken}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
