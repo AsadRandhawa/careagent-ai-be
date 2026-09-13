@@ -48,6 +48,19 @@ model User {
   facebookPageToken     String?
   facebookEnabled       Boolean         @default(true)
   instagramBusinessId   String?
+  // Instagram Business Login access token — a DIFFERENT credential from
+  // facebookPageToken, confirmed the hard way: this app uses the newer
+  // Instagram API with Business Login (instagram_business_basic /
+  // instagram_business_manage_messages), which requires a token generated
+  // directly per Instagram account through Meta's "Generate access
+  // tokens" flow under that use case — NOT the Facebook Page token used
+  // by the older Page-linked integration. Sends were failing with
+  // "(#3) Application does not have the capability" all along because
+  // facebookPageToken was never valid for this API at all, regardless of
+  // permissions or tester status. Manually obtained per account for now
+  // (no automated OAuth flow wired up in CareAgent's own Channels page
+  // yet) — see the SQL in the migration notes for how this gets set.
+  instagramAccessToken  String?
   instagramConnected    Boolean         @default(false)
   instagramEnabled      Boolean         @default(true)
   instagramAutoSend     Boolean         @default(false)
