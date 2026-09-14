@@ -294,7 +294,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
         lastSeenInboxAt: true, lastSeenEscalAt: true,
         facebookConnected: true, facebookPageName: true, facebookEnabled: true,
         instagramConnected: true, instagramUsername: true, instagramEnabled: true, instagramAutoSend: true,
-        livechatAutoSend: true, whatsappAutoSend: true,
+        livechatAutoSend: true, whatsappAutoSend: true, nativeRagPromptAddendum: true,
         whatsappToken: true, whatsappPhoneNumberId: true, whatsappWabaId: true,
       }
     });
@@ -332,7 +332,8 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
       knowledgeBase: {
         documents: user.documents,
         businessIdentity: user.businessIdentity,
-        brandVoice: user.brandVoice
+        brandVoice: user.brandVoice,
+        aiInstructions: user.nativeRagPromptAddendum ?? '',
       }
     });
   } catch (err) {
@@ -363,6 +364,148 @@ app.post('/api/user/knowledge-base', authenticateToken, async (req, res) => {
     res.json({ success: true, reindexed: reindexResult });
   } catch (err) {
     res.status(500).json({ error: 'Failed to update knowledge base' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// PRIORITY FACTS — self-service curated facts (force-include via
+// DocumentChunk.triggerPattern, same mechanism findRelevantChunks()
+// already uses). Previously only settable by a developer running
+// migrate-leads-curated-facts.js by hand for one specific account — these
+// four endpoints make that a normal in-app feature for any client.
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+// Builds a safe trigger regex from plain keywords a non-technical user
+// types in — e.g. ["BS Data Science", "data science"] becomes
+// \b(BS\ Data\ Science|data\ science)\b — so nobody needs to write raw
+// regex themselves. Each keyword is escaped individually; word boundaries
+// wrap the whole alternation, matching the pattern style already used by
+// every hand-written curated fact in migrate-leads-curated-facts.js.
+function buildTriggerPattern(keywords) {
+  const cleaned = keywords.map(k => k.trim()).filter(Boolean);
+  if (cleaned.length === 0) return null;
+  const escaped = cleaned.map(k => escapeRegex(k).replace(/ /g, '\\s+'));
+  return `\\b(${escaped.join('|')})\\b`;
+}
+const CURATED_FACT_DOC_PREFIX = '[Curated Fact] ';
+
+app.get('/api/user/curated-facts', authenticateToken, async (req, res) => {
+  try {
+    const facts = await prisma.$queryRaw`
+      SELECT "id", "docName", "content", "triggerPattern"
+      FROM "DocumentChunk"
+      WHERE "userId" = ${req.user.userId} AND "triggerPattern" IS NOT NULL
+      ORDER BY "createdAt" DESC
+    `;
+    res.json(facts.map(f => ({
+      id: f.id,
+      title: f.docName.startsWith(CURATED_FACT_DOC_PREFIX) ? f.docName.slice(CURATED_FACT_DOC_PREFIX.length) : f.docName,
+      content: f.content,
+      triggerPattern: f.triggerPattern,
+    })));
+  } catch (err) {
+    console.error('[curated-facts GET]', err.message);
+    res.status(500).json({ error: 'Failed to load priority facts' });
+  }
+});
+
+app.post('/api/user/curated-facts', authenticateToken, async (req, res) => {
+  try {
+    const { title, content, triggerKeywords } = req.body;
+    if (!title?.trim() || !content?.trim()) {
+      return res.status(400).json({ error: 'title and content are required' });
+    }
+    if (!Array.isArray(triggerKeywords) || triggerKeywords.length === 0) {
+      return res.status(400).json({ error: 'At least one trigger keyword/phrase is required — this is what makes the fact force-include.' });
+    }
+    const triggerPattern = buildTriggerPattern(triggerKeywords);
+    const docName = `${CURATED_FACT_DOC_PREFIX}${title.trim()}`;
+    const embedding = await embedText(content.trim());
+    const vectorLiteral = `[${embedding.join(',')}]`;
+    const inserted = await prisma.$queryRaw`
+      INSERT INTO "DocumentChunk" ("id", "userId", "docName", "content", "embedding", "triggerPattern", "createdAt")
+      VALUES (gen_random_uuid(), ${req.user.userId}, ${docName}, ${content.trim()}, ${vectorLiteral}::vector, ${triggerPattern}, NOW())
+      RETURNING "id"
+    `;
+    res.json({ success: true, id: inserted[0].id });
+  } catch (err) {
+    console.error('[curated-facts POST]', err.message);
+    res.status(500).json({ error: 'Failed to create priority fact' });
+  }
+});
+
+app.put('/api/user/curated-facts/:id', authenticateToken, async (req, res) => {
+  try {
+    const { title, content, triggerKeywords } = req.body;
+    if (!title?.trim() || !content?.trim()) {
+      return res.status(400).json({ error: 'title and content are required' });
+    }
+    if (!Array.isArray(triggerKeywords) || triggerKeywords.length === 0) {
+      return res.status(400).json({ error: 'At least one trigger keyword/phrase is required.' });
+    }
+    // Ownership check first — never let one account edit another's facts
+    // via a guessed/leaked id.
+    const existing = await prisma.$queryRaw`
+      SELECT "id" FROM "DocumentChunk" WHERE "id" = ${req.params.id} AND "userId" = ${req.user.userId}
+    `;
+    if (existing.length === 0) return res.status(404).json({ error: 'Priority fact not found' });
+
+    const triggerPattern = buildTriggerPattern(triggerKeywords);
+    const docName = `${CURATED_FACT_DOC_PREFIX}${title.trim()}`;
+    // Re-embed since content may have changed — cheap (one embedding
+    // call), and correctness matters more than saving it here.
+    const embedding = await embedText(content.trim());
+    const vectorLiteral = `[${embedding.join(',')}]`;
+    await prisma.$executeRaw`
+      UPDATE "DocumentChunk"
+      SET "docName" = ${docName}, "content" = ${content.trim()}, "embedding" = ${vectorLiteral}::vector, "triggerPattern" = ${triggerPattern}
+      WHERE "id" = ${req.params.id} AND "userId" = ${req.user.userId}
+    `;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[curated-facts PUT]', err.message);
+    res.status(500).json({ error: 'Failed to update priority fact' });
+  }
+});
+
+app.delete('/api/user/curated-facts/:id', authenticateToken, async (req, res) => {
+  try {
+    await prisma.$executeRaw`
+      DELETE FROM "DocumentChunk" WHERE "id" = ${req.params.id} AND "userId" = ${req.user.userId}
+    `;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[curated-facts DELETE]', err.message);
+    res.status(500).json({ error: 'Failed to delete priority fact' });
+  }
+});
+
+// PATCH — save the account's AI Instructions (nativeRagPromptAddendum).
+// This is the same field previously only editable via a one-off Node
+// script + manual SQL — exposing it here is what makes per-account
+// business rules self-service instead of requiring a developer to
+// hand-write and push them for every client.
+app.patch('/api/user/ai-instructions', authenticateToken, async (req, res) => {
+  try {
+    const { aiInstructions } = req.body;
+    if (typeof aiInstructions !== 'string') {
+      return res.status(400).json({ error: 'aiInstructions must be a string' });
+    }
+    // Generous but bounded — this gets injected into every single draft's
+    // system prompt, so an unbounded value here directly inflates the
+    // cost and latency of every message this account ever sends.
+    if (aiInstructions.length > 20000) {
+      return res.status(400).json({ error: 'AI Instructions must be 20,000 characters or fewer.' });
+    }
+    await prisma.user.update({
+      where: { id: req.user.userId },
+      data: { nativeRagPromptAddendum: aiInstructions || null },
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[ai-instructions]', err.message);
+    res.status(500).json({ error: 'Failed to save AI Instructions' });
   }
 });
 
