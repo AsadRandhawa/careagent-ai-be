@@ -1325,6 +1325,18 @@ const VALID_SENTIMENTS = ['Positive', 'Neutral', 'Frustrated']; // kept consiste
 // writes — the two callers persist results completely differently
 // (Gmail's route keys tickets by externalId; Instagram tickets are
 // already real Ticket rows from getOrCreateTicket).
+// Safe, generic acknowledgment sent to the customer when an auto-reply
+// escalates because OUR CODE forced it (grounding check catching an
+// unverified figure) — the model's own draft text in that case still
+// contains the unverified/possibly-wrong number, so it can't be sent as-is.
+// When the MODEL itself chose to escalate instead, its own draft text is
+// used directly (see codeForcedEscalation on generateNativeDraft's return),
+// since the addendum already has it write an appropriate acknowledgment in
+// that case. Either way, the customer gets SOMETHING rather than silence
+// while waiting for a human — silence until someone happens to notice an
+// escalated ticket is not acceptable, confirmed by real user feedback.
+const ESCALATION_FALLBACK_MESSAGE = "Thanks for your question! I want to make sure I give you fully accurate information here, so I've flagged this for our team to confirm — they'll follow up with you shortly.";
+
 async function generateNativeDraft(userId, { customerName, messageText, customInstructions, channel, history = [] }) {
   const user = await prisma.user.findUnique({
     where: { id: userId },
@@ -1451,6 +1463,15 @@ ${customInstructions ? `Additional instructions for this draft (from the agent, 
   // verbatim in KB text since they're valid arithmetic on a real number).
   let finalStatus = draftObj.status === 'escalated' ? 'escalated' : 'draft';
   let finalReason = draftObj.reason;
+  // Distinguishes two different kinds of escalation for callers: if the
+  // MODEL itself chose to escalate, draftObj.draft is a safe, addendum-
+  // compliant acknowledgment message ("I've flagged this for our team...")
+  // that's fine to send to the customer. If OUR CODE forces escalation
+  // (the grounding check below), draftObj.draft still contains the
+  // unverified/possibly-wrong figure that triggered it — NOT safe to send
+  // as-is. Callers use this flag to decide whether to send `draft` or a
+  // generic safe fallback acknowledgment instead.
+  let codeForcedEscalation = false;
   if (finalStatus === 'draft' && hasUsableDraft) {
     // Only check BASE tuition statements ("Tuition Fee (per semester): X
     // PKR") — skip anything qualified as discounted/computed ("Discounted
@@ -1480,6 +1501,7 @@ ${customInstructions ? `Additional instructions for this draft (from the agent, 
         console.error(`[Grounding Check] Draft: ${draftObj.draft.slice(0, 300)}`);
         console.error(`[Grounding Check] Retrieved kbSnippets (first 3000 chars): ${kbSnippets.slice(0, 3000)}`);
         finalStatus = 'escalated';
+        codeForcedEscalation = true;
         finalReason = 'AI stated a fee figure that could not be verified against the retrieved knowledge base for this specific program — flagged for human review rather than risking an incorrect number.';
         break;
       }
@@ -1540,6 +1562,7 @@ ${customInstructions ? `Additional instructions for this draft (from the agent, 
     status: finalStatus,
     draft: draftObj.draft,
     reason: finalReason,
+    codeForcedEscalation,
     category, sentiment, urgency,
   };
 }
@@ -2439,6 +2462,12 @@ async function tryAutoReplyWhatsAppNative(user, ticket, currentMessageText) {
     });
 
     if (result.status === 'escalated') {
+      const ackMessage = result.codeForcedEscalation ? ESCALATION_FALLBACK_MESSAGE : result.draft;
+      try {
+        await sendWhatsAppMessage(user, ticket, ackMessage, 'AI (escalation ack)');
+      } catch (ackErr) {
+        console.error(`[WhatsApp AutoReply] Escalation acknowledgment failed to send for ticket ${ticket.id}:`, ackErr.message);
+      }
       await prisma.ticket.update({
         where: { id: ticket.id },
         data: {
@@ -2507,11 +2536,16 @@ async function tryAutoReplyWebsiteNative(user, session, currentMessageText) {
     });
 
     if (result.status === 'escalated') {
+      const ackMessage = result.codeForcedEscalation ? ESCALATION_FALLBACK_MESSAGE : result.draft;
+      await prisma.chatMessage.create({
+        data: { sessionId: session.id, role: 'agent', content: ackMessage },
+      });
       await prisma.chatSession.update({
         where: { id: session.id },
         data: {
           escalated: true,
           escalationReason: result.reason || 'AI could not confidently answer — flagged for human follow-up.',
+          updatedAt: new Date(),
         },
       });
       return;
@@ -2625,6 +2659,22 @@ async function tryAutoReplyInstagramNative(user, ticket, currentMessageText) {
     });
 
     if (result.status === 'escalated') {
+      const ackMessage = result.codeForcedEscalation ? ESCALATION_FALLBACK_MESSAGE : result.draft;
+      try {
+        const ackRes = await fetch(
+          `https://graph.instagram.com/v21.0/${user.instagramBusinessId}/messages?access_token=${user.instagramAccessToken}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ recipient: { id: ticket.threadId }, message: { text: ackMessage } }),
+          }
+        );
+        if (!ackRes.ok) {
+          console.error(`[Instagram AutoReply] Escalation acknowledgment failed to send for ticket ${ticket.id}: HTTP ${ackRes.status}`);
+        }
+      } catch (ackErr) {
+        console.error(`[Instagram AutoReply] Escalation acknowledgment failed to send for ticket ${ticket.id}:`, ackErr.message);
+      }
       await prisma.ticket.update({
         where: { id: ticket.id },
         data: {
