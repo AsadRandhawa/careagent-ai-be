@@ -1518,10 +1518,20 @@ ${customInstructions ? `Additional instructions for this draft (from the agent, 
     if ([admission, enrollment, tuition, examination, library, statedTotal].every(n => n !== null)) {
       const actualSum = admission + enrollment + tuition + examination + library;
       if (actualSum !== statedTotal) {
-        console.error(`[Arithmetic Check] Stated total ${statedTotal} PKR does not match sum of line items ${actualSum} PKR (${admission}+${enrollment}+${tuition}+${examination}+${library}) — escalating instead of sending.`);
-        console.error(`[Arithmetic Check] Draft: ${draftObj.draft.slice(0, 300)}`);
-        finalStatus = 'escalated';
-        finalReason = `AI's stated total (${statedTotal} PKR) did not match the sum of its own line items (${actualSum} PKR) — flagged for human review rather than sending an arithmetic error.`;
+        // Auto-correct rather than escalate: we already parsed all five
+        // line items to run this check, so we KNOW the right total — no
+        // need to leave the customer with silence until a human happens
+        // to notice an escalated ticket. Only the grounding check above
+        // (unverified figures) needs to escalate, since there we don't
+        // know the correct value — here we do, so just fix it.
+        const correctedTotalStr = actualSum.toLocaleString('en-US');
+        const lastTotalMatch = totalMatches[totalMatches.length - 1];
+        const originalTotalText = lastTotalMatch[0]; // full matched "Total...: X PKR" text
+        const correctedTotalText = originalTotalText.replace(lastTotalMatch[1], correctedTotalStr);
+        draftObj.draft = draftObj.draft.slice(0, lastTotalMatch.index)
+          + correctedTotalText
+          + draftObj.draft.slice(lastTotalMatch.index + originalTotalText.length);
+        console.log(`[Arithmetic Check] Auto-corrected total from ${statedTotal} to ${actualSum} PKR (${admission}+${enrollment}+${tuition}+${examination}+${library}) — sending corrected version.`);
       }
     }
   }
