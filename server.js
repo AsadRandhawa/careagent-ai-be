@@ -2130,8 +2130,15 @@ app.post('/api/instagram/reply', authenticateToken, requireIdempotencyKey, async
       return res.status(400).json({ error: 'Instagram not connected' });
     }
 
+    // MUST be graph.instagram.com, NOT graph.facebook.com — confirmed the
+    // hard way: instagramAccessToken is an Instagram Platform token (from
+    // Instagram API with Instagram Login), and Meta's auth layer for
+    // graph.facebook.com doesn't recognize that token type at all, even
+    // when it's valid with the right scopes. Calling the wrong host
+    // produced a misleading "cannot parse access token" error that looked
+    // like a token problem but was actually a wrong-endpoint problem.
     const sendRes = await fetch(
-      `https://graph.facebook.com/v19.0/${user.instagramBusinessId}/messages?access_token=${user.instagramAccessToken}`,
+      `https://graph.instagram.com/v21.0/${user.instagramBusinessId}/messages?access_token=${user.instagramAccessToken}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2619,8 +2626,10 @@ async function tryAutoReplyInstagramNative(user, ticket, currentMessageText) {
       return;
     }
 
+    // MUST be graph.instagram.com, NOT graph.facebook.com — see comment
+    // in /api/instagram/reply above for the full explanation.
     const sendRes = await fetch(
-      `https://graph.facebook.com/v19.0/${user.instagramBusinessId}/messages?access_token=${user.instagramAccessToken}`,
+      `https://graph.instagram.com/v21.0/${user.instagramBusinessId}/messages?access_token=${user.instagramAccessToken}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
