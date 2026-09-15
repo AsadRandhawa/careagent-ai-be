@@ -61,6 +61,13 @@ model User {
   // (no automated OAuth flow wired up in CareAgent's own Channels page
   // yet) — see the SQL in the migration notes for how this gets set.
   instagramAccessToken  String?
+  // Help Desk / complaint system integration — opt-in per account, since
+  // this is a real external system (currently Leads University's, but
+  // built generically so any account's own Help Desk could plug in with
+  // a different base URL). Off by default: nothing about complaint
+  // handling activates unless both are set.
+  complaintDeskEnabled  Boolean         @default(false)
+  complaintApiBaseUrl   String?
   instagramConnected    Boolean         @default(false)
   instagramEnabled      Boolean         @default(true)
   instagramAutoSend     Boolean         @default(false)
@@ -80,6 +87,7 @@ model User {
   documentChunks        DocumentChunk[]
   tickets               Ticket[]
   leads                 Lead[]
+  complaints            Complaint[]
 }
 
 model DocumentChunk {
@@ -127,6 +135,7 @@ model Ticket {
   Message          Message[]
   user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   lead             Lead?
+  complaints       Complaint[]
 
   @@unique([userId, externalId])
   @@unique([userId, channel, threadId])
@@ -152,6 +161,7 @@ model ChatSession {
   updatedAt   DateTime      @updatedAt
   messages    ChatMessage[]
   user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  complaints  Complaint[]
 
   @@index([userId])
   @@index([userId, status])
@@ -167,6 +177,56 @@ model ChatMessage {
   session   ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
   @@index([sessionId, createdAt])
+}
+
+// Cross-channel Help Desk complaint tracking. Standalone rather than
+// bolted onto Ticket or ChatSession, since complaints can originate from
+// EITHER (Gmail/Facebook/Instagram/WhatsApp use Ticket, Website Live Chat
+// uses ChatSession — the existing architectural split throughout this
+// schema) and a unified Escalations-style dashboard needs to query them
+// the same way regardless of origin. At most one of ticketId/chatSessionId
+// is set, matching whichever channel the complaint came in on.
+//
+// Field names are provisional pending the external Help Desk system's
+// real register/track API contract — may need remapping once that's
+// available, but the shape here (name/email/department/description in,
+// trackingNumber + status out) matches the brief's described requirements.
+model Complaint {
+  id               String       @id @default(uuid())
+  userId           String
+  ticketId         String?
+  chatSessionId    String?
+  channel          String       // whatsapp | facebook | instagram | website | gmail
+
+  // The external Help Desk system's own tracking number, returned by its
+  // register API — this is what the student later provides to check
+  // status, not an internal CareAgent id.
+  trackingNumber   String       @unique
+
+  // Collected from the student during the conversational qualifying-
+  // question flow before registering.
+  complainantName  String
+  complainantEmail String
+  department       String
+  description      String       @db.Text
+
+  // Synced FROM the external track API on demand, not computed locally —
+  // that system is the actual source of truth (admins update status on
+  // their own portal, not through CareAgent). "submitted" is our own
+  // local default before the first sync confirms a real status.
+  status           String       @default("submitted")
+  lastSyncedAt     DateTime?
+
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  user             User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ticket           Ticket?      @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+  chatSession      ChatSession? @relation(fields: [chatSessionId], references: [id], onDelete: SetNull)
+
+  @@index([userId, status])
+  @@index([userId, channel])
+  @@index([trackingNumber])
 }
 
 model Message {
