@@ -294,7 +294,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
         lastSeenInboxAt: true, lastSeenEscalAt: true,
         facebookConnected: true, facebookPageName: true, facebookEnabled: true,
         instagramConnected: true, instagramUsername: true, instagramEnabled: true, instagramAutoSend: true,
-        livechatAutoSend: true, whatsappAutoSend: true, nativeRagPromptAddendum: true,
+        livechatAutoSend: true, whatsappAutoSend: true, facebookAutoSend: true, nativeRagPromptAddendum: true,
         whatsappToken: true, whatsappPhoneNumberId: true, whatsappWabaId: true,
       }
     });
@@ -313,6 +313,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
       instagramAutoSend:  user.instagramAutoSend   ?? false,
       livechatAutoSend:   user.livechatAutoSend    ?? false,
       whatsappAutoSend:   user.whatsappAutoSend    ?? false,
+      facebookAutoSend:   user.facebookAutoSend    ?? false,
       // WhatsApp is "connected" for this account if either: (a) they went
       // through Embedded Signup and have their own token/number stored, or
       // (b) they're the single-tenant fallback account configured via env
@@ -514,7 +515,7 @@ app.patch('/api/user/preferences', authenticateToken, async (req, res) => {
   try {
     const { gmailEnabled, lastSeenInboxAt, lastSeenEscalAt,
             aiAutoDrafting, autoClassification, sentimentTracking, facebookEnabled, instagramEnabled,
-            instagramAutoSend, livechatAutoSend, whatsappAutoSend } = req.body;
+            instagramAutoSend, livechatAutoSend, whatsappAutoSend, facebookAutoSend } = req.body;
     const data = {};
     if (gmailEnabled          !== undefined) data.gmailEnabled          = gmailEnabled;
     if (facebookEnabled       !== undefined) data.facebookEnabled       = facebookEnabled;
@@ -522,6 +523,7 @@ app.patch('/api/user/preferences', authenticateToken, async (req, res) => {
     if (instagramAutoSend     !== undefined) data.instagramAutoSend     = instagramAutoSend;
     if (livechatAutoSend      !== undefined) data.livechatAutoSend      = livechatAutoSend;
     if (whatsappAutoSend      !== undefined) data.whatsappAutoSend      = whatsappAutoSend;
+    if (facebookAutoSend      !== undefined) data.facebookAutoSend      = facebookAutoSend;
     if (aiAutoDrafting        !== undefined) data.aiAutoDrafting        = aiAutoDrafting;
     if (autoClassification    !== undefined) data.autoClassification    = autoClassification;
     if (sentimentTracking     !== undefined) data.sentimentTracking     = sentimentTracking;
@@ -1657,6 +1659,30 @@ THREE POSSIBLE ACTIONS — REGISTER, TRACK, REOPEN:
    your judgment, never ask the customer to pick a priority level
    explicitly).
 
+   DEPARTMENT — MANDATORY CONFIRMATION, NEVER SILENT: matching the
+   customer's issue to the correct department by NAME is not always
+   obvious (e.g. "WiFi is slow" could plausibly be IT, Facilities, or
+   something else depending on what departments actually exist) — a
+   wrong silent guess here means a real complaint goes to the wrong
+   team. Before setting ready:true, you MUST explicitly state which
+   department you've matched them to, by its real name from the list
+   above, as part of your reply (e.g. "I'll file this under the IT
+   Department — let me know if that's not right"), and only proceed if
+   the customer doesn't correct you. Never pick a department and go
+   straight to registering without saying its name out loud first.
+
+   NO GENUINE MATCH — ESCALATE, DO NOT FORCE-FIT: the department list
+   above may be small and may NOT cover every real kind of complaint
+   (e.g. hostel conditions, an academic/grading dispute, harassment,
+   fee disputes) — do not force a complaint into a department that
+   doesn't actually handle that kind of issue just because it's the
+   closest of a small set of options. If nothing in the list is a
+   genuine, sensible fit for what the customer described, do NOT
+   register it — instead set status to "escalated" and explain that
+   this specific type of issue doesn't have a matching department in
+   the system yet, so a human will follow up directly. A wrong
+   department is worse than no automatic registration at all.
+
 2) TRACK an existing complaint's status. Required: their reference
    number, AND EITHER their email OR their registration number (never
    accept a bare reference number alone — this is a real security
@@ -2322,6 +2348,7 @@ app.post('/api/facebook/webhook', async (req, res) => {
         await recordMessage(ticket, {
           direction: 'inbound', externalId: event.message.mid, content: text, senderName: customerName, at: receivedAt,
         });
+        await tryAutoReplyFacebookNative(user, ticket, text);
       }
     }
   } catch (err) {
@@ -3094,6 +3121,105 @@ async function tryAutoReplyInstagramNative(user, ticket, currentMessageText) {
     });
   } catch (err) {
     console.error(`[Instagram AutoReply] Failed for ticket ${ticket.id}, leaving for human review:`, err.message);
+  }
+}
+
+// ── Facebook Messenger autonomous reply (opt-in per account) ────────────────
+// Facebook never had a native auto-reply function at all until this —
+// every prior mention of "Facebook" in this file was human-review only.
+// Mirrors tryAutoReplyInstagramNative's pattern exactly: generateNativeDraft's
+// "draft" sends automatically, "escalated" holds for a human.
+//
+// One real, expected difference from Instagram/WhatsApp: Messenger
+// strictly enforces the 24-hour customer service window (Meta error code
+// 10) — a normal, common occurrence here (any ticket idle over a day),
+// not a bug. Logged distinctly so it's not confused with a real failure
+// when reviewing logs.
+//
+// Off by default (User.facebookAutoSend) — same reasoning as every other
+// channel: don't trust any account's AI unsupervised until observed
+// against that account's real knowledge base first.
+async function tryAutoReplyFacebookNative(user, ticket, currentMessageText) {
+  if (!user.facebookAutoSend) return;
+  if (!user.facebookPageId || !user.facebookPageToken) return;
+
+  try {
+    const priorMessages = await prisma.message.findMany({
+      where: { ticketId: ticket.id },
+      orderBy: { createdAt: 'asc' },
+    });
+    const history = priorMessages
+      .slice(0, -1)
+      .map(m => ({ role: m.direction === 'outbound' ? 'assistant' : 'user', content: m.content }));
+
+    const result = await generateNativeDraft(user.id, {
+      customerName: ticket.customerName,
+      messageText: currentMessageText,
+      channel: 'facebook',
+      history,
+      allowSideEffects: true,
+    });
+
+    const sendToMessenger = async (text) => {
+      return fetch(`https://graph.facebook.com/v19.0/me/messages?access_token=${user.facebookPageToken}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recipient: { id: ticket.threadId },
+          message: { text },
+        }),
+      });
+    };
+
+    if (result.status === 'escalated') {
+      const ackMessage = result.codeForcedEscalation ? ESCALATION_FALLBACK_MESSAGE : result.draft;
+      try {
+        const ackRes = await sendToMessenger(ackMessage);
+        if (!ackRes.ok) {
+          console.error(`[Facebook AutoReply] Escalation acknowledgment failed to send for ticket ${ticket.id}: HTTP ${ackRes.status}`);
+        }
+      } catch (ackErr) {
+        console.error(`[Facebook AutoReply] Escalation acknowledgment failed to send for ticket ${ticket.id}:`, ackErr.message);
+      }
+      await prisma.ticket.update({
+        where: { id: ticket.id },
+        data: {
+          status: 'escalated',
+          escalationReason: result.reason || 'AI could not confidently answer — flagged for human follow-up.',
+          sentiment: result.sentiment, category: result.category, urgency: result.urgency,
+        },
+      });
+      return;
+    }
+
+    const sendRes = await sendToMessenger(result.draft);
+    if (!sendRes.ok) {
+      const errBody = await sendRes.json().catch(() => null);
+      const metaError = errBody?.error;
+      if (metaError?.code === 10 && /outside the allowed window/i.test(metaError?.message || '')) {
+        console.error(`[Facebook AutoReply] 24-hour messaging window closed for ticket ${ticket.id} — normal platform policy, not an error. Leaving for human review.`);
+      } else {
+        console.error(
+          `[Facebook AutoReply] Send failed for ticket ${ticket.id} — leaving for human review. ` +
+          `Status: ${sendRes.status}. Meta error: ${metaError ? JSON.stringify(metaError) : '(no JSON body)'}`
+        );
+      }
+      return;
+    }
+    const sendData = await sendRes.json().catch(() => ({}));
+    await recordMessage(ticket, {
+      direction: 'outbound', externalId: sendData?.message_id || null,
+      content: result.draft, senderName: 'AI (auto-reply)',
+    });
+    await prisma.ticket.update({
+      where: { id: ticket.id },
+      data: {
+        status: 'resolved', resolvedAt: new Date(),
+        sentiment: result.sentiment, category: result.category, urgency: result.urgency,
+      },
+    });
+  } catch (err) {
+    console.error(`[Facebook AutoReply] Failed for ticket ${ticket.id}, leaving for human review:`, err.message);
   }
 }
 
