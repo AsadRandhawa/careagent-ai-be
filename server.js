@@ -62,6 +62,7 @@ app.use(cors({
     'https://careagent-ai-fe-production.up.railway.app',
     'http://localhost:3000',
     'http://localhost:5173',
+    'https://leads-widget-webchat-production.up.railway.app',
   ],
   credentials: true,
 }));
