@@ -82,6 +82,13 @@ model User {
   // tryAutoReplyWhatsAppNative() — every other WhatsApp account stays
   // human-review-only until explicitly opted in.
   whatsappAutoSend      Boolean         @default(false)
+  // Facebook Messenger auto-send — same opt-in pattern. Facebook never
+  // had a native auto-reply function at all until this field — see
+  // tryAutoReplyFacebookNative(). Genuinely more likely to hit Meta's
+  // 24-hour messaging window than other channels, since Messenger
+  // enforces that policy strictly — see the (#10) error handling in
+  // /api/facebook/reply and this function's own send call.
+  facebookAutoSend      Boolean         @default(false)
   instagramUsername     String?
   chatSessions          ChatSession[]
   documentChunks        DocumentChunk[]
