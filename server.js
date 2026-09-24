@@ -62,7 +62,7 @@ app.use(cors({
     'https://careagent-ai-fe-production.up.railway.app',
     'http://localhost:3000',
     'http://localhost:5173',
-    'https://leads-widget-webchat-production.up.railway.app',
+    'https://leads-widget-webchat-production.up.railway.app'
   ],
   credentials: true,
 }));
@@ -2550,19 +2550,19 @@ app.post('/api/instagram/reply', authenticateToken, requireIdempotencyKey, async
     if (!threadId || !body?.trim()) return res.status(400).json({ error: 'threadId and body required' });
 
     const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
-    if (!user?.instagramBusinessId || !user?.instagramAccessToken) {
+    if (!user?.instagramBusinessId || !user?.facebookPageToken) {
       return res.status(400).json({ error: 'Instagram not connected' });
     }
 
-    // MUST be graph.instagram.com, NOT graph.facebook.com — confirmed the
-    // hard way: instagramAccessToken is an Instagram Platform token (from
-    // Instagram API with Instagram Login), and Meta's auth layer for
-    // graph.facebook.com doesn't recognize that token type at all, even
-    // when it's valid with the right scopes. Calling the wrong host
-    // produced a misleading "cannot parse access token" error that looked
-    // like a token problem but was actually a wrong-endpoint problem.
+    // Uses graph.facebook.com + facebookPageToken, NOT graph.instagram.com +
+    // instagramAccessToken. This account connects via the classic "Instagram
+    // API with Facebook Login" (Page-linked) flow — see /api/auth/facebook's
+    // scope (instagram_basic, instagram_manage_messages) — which only ever
+    // issues a Page access token. There is no separate Instagram Platform
+    // token in this flow, so instagramAccessToken is never populated; the
+    // Page token is the correct, and only, credential for sending here.
     const sendRes = await fetch(
-      `https://graph.instagram.com/v21.0/${user.instagramBusinessId}/messages?access_token=${user.instagramAccessToken}`,
+      `https://graph.facebook.com/v19.0/me/messages?access_token=${user.facebookPageToken}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3031,7 +3031,7 @@ If has_qualifying_info is false, all other fields must be null.`;
 // caught a real hallucination bug on WhatsApp before it caused harm.
 async function tryAutoReplyInstagramNative(user, ticket, currentMessageText) {
   if (!user.instagramAutoSend) return;
-  if (!user.instagramBusinessId || !user.instagramAccessToken) return;
+  if (!user.instagramBusinessId || !user.facebookPageToken) return;
 
   try {
     // Same history-building fix as WhatsApp/Website — without this, every
@@ -3056,7 +3056,7 @@ async function tryAutoReplyInstagramNative(user, ticket, currentMessageText) {
       const ackMessage = result.codeForcedEscalation ? ESCALATION_FALLBACK_MESSAGE : result.draft;
       try {
         const ackRes = await fetch(
-          `https://graph.instagram.com/v21.0/${user.instagramBusinessId}/messages?access_token=${user.instagramAccessToken}`,
+          `https://graph.facebook.com/v19.0/me/messages?access_token=${user.facebookPageToken}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -3080,10 +3080,10 @@ async function tryAutoReplyInstagramNative(user, ticket, currentMessageText) {
       return;
     }
 
-    // MUST be graph.instagram.com, NOT graph.facebook.com — see comment
-    // in /api/instagram/reply above for the full explanation.
+    // Uses graph.facebook.com + facebookPageToken — see comment in
+    // /api/instagram/reply above for the full explanation.
     const sendRes = await fetch(
-      `https://graph.instagram.com/v21.0/${user.instagramBusinessId}/messages?access_token=${user.instagramAccessToken}`,
+      `https://graph.facebook.com/v19.0/me/messages?access_token=${user.facebookPageToken}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
