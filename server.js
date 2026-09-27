@@ -3496,52 +3496,65 @@ app.post('/api/whatsapp/connect', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Failed to obtain a long-lived access token.' });
     }
 
-    // Step 2b: fall back to discovering wabaId/phoneNumberId via Graph API
-    // when the frontend didn't capture them from Meta's WA_EMBEDDED_SIGNUP
+    // Step 2b: fall back to discovering wabaId/phoneNumberId when the
+    // frontend didn't capture them from Meta's WA_EMBEDDED_SIGNUP
     // postMessage event. Confirmed (2026-09-27) that postMessage is only
     // reliably emitted by the full new-number onboarding wizard — when a
     // business shares an EXISTING, already-verified WABA/number through
     // Meta's simpler "select business assets to share" consent screen
     // instead, no WA_EMBEDDED_SIGNUP event fires at all, in any browser
     // (verified against two independent browsers, ruling out a
-    // browser/extension blocking theory). The long-lived token's
-    // visibility is already scoped to exactly what was granted in that
-    // consent screen, so walking /me/businesses -> owned WABAs -> phone
-    // numbers is unambiguous, not a guess across unrelated assets.
+    // browser/extension blocking theory).
+    //
+    // First attempt used /me/businesses -> owned_whatsapp_business_accounts,
+    // but that failed with a real, confirmed error: "(#100) Missing
+    // Permission" — this token (scoped for WhatsApp Embedded Signup) never
+    // carries business_management, only whatsapp_business_management/
+    // whatsapp_business_messaging, so it can't list businesses at all.
+    //
+    // Correct approach (Meta's own documented fallback for exactly this
+    // case): call /debug_token, authenticated with the APP's own
+    // credentials (not the user token's permissions, which is why this
+    // works regardless of what the user token itself can call). Its
+    // granular_scopes array names the exact WABA id(s) this specific token
+    // was granted under whatsapp_business_management/_messaging — reading
+    // it directly is unambiguous, not a guess across unrelated assets.
+    // Fetching phone_numbers on that WABA only needs
+    // whatsapp_business_management scoped to that WABA, which this token
+    // does carry.
     if (!wabaId || !phoneNumberId) {
-      console.log('[WhatsApp] wabaId/phoneNumberId not supplied by frontend — discovering via Graph API.');
+      console.log('[WhatsApp] wabaId/phoneNumberId not supplied by frontend — discovering via debug_token granular scopes.');
       try {
-        const bizRes = await fetch(
-          `https://graph.facebook.com/v19.0/me/businesses?access_token=${longLivedData.access_token}`
+        const appToken = `${process.env.META_APP_ID}|${process.env.META_APP_SECRET}`;
+        const debugRes = await fetch(
+          `https://graph.facebook.com/v19.0/debug_token?input_token=${longLivedData.access_token}&access_token=${appToken}`
         );
-        const bizData = await bizRes.json();
-        console.log('[WhatsApp] Discovery — businesses visible to this token:', JSON.stringify(bizData));
+        const debugData = await debugRes.json();
+        console.log('[WhatsApp] Discovery — debug_token result:', JSON.stringify(debugData));
 
-        outer:
-        for (const business of bizData?.data || []) {
-          const wabaRes = await fetch(
-            `https://graph.facebook.com/v19.0/${business.id}/owned_whatsapp_business_accounts?access_token=${longLivedData.access_token}`
+        const granularScopes = debugData?.data?.granular_scopes || [];
+        const waScope =
+          granularScopes.find(s => s.scope === 'whatsapp_business_management') ||
+          granularScopes.find(s => s.scope === 'whatsapp_business_messaging');
+        const discoveredWabaId = waScope?.target_ids?.[0];
+
+        if (discoveredWabaId) {
+          const numbersRes = await fetch(
+            `https://graph.facebook.com/v19.0/${discoveredWabaId}/phone_numbers?access_token=${longLivedData.access_token}`
           );
-          const wabaData = await wabaRes.json();
-          console.log(`[WhatsApp] Discovery — WABAs owned by business ${business.id}:`, JSON.stringify(wabaData));
+          const numbersData = await numbersRes.json();
+          console.log(`[WhatsApp] Discovery — phone numbers on WABA ${discoveredWabaId}:`, JSON.stringify(numbersData));
 
-          for (const waba of wabaData?.data || []) {
-            const numbersRes = await fetch(
-              `https://graph.facebook.com/v19.0/${waba.id}/phone_numbers?access_token=${longLivedData.access_token}`
-            );
-            const numbersData = await numbersRes.json();
-            console.log(`[WhatsApp] Discovery — phone numbers on WABA ${waba.id}:`, JSON.stringify(numbersData));
-
-            const firstNumber = numbersData?.data?.[0];
-            if (firstNumber?.id) {
-              wabaId = waba.id;
-              phoneNumberId = firstNumber.id;
-              break outer;
-            }
+          const firstNumber = numbersData?.data?.[0];
+          if (firstNumber?.id) {
+            wabaId = discoveredWabaId;
+            phoneNumberId = firstNumber.id;
           }
+        } else {
+          console.error('[WhatsApp] Discovery — no whatsapp_business_management/_messaging granular scope found on token.');
         }
       } catch (discoverErr) {
-        console.error('[WhatsApp] Discovery via Graph API failed:', discoverErr.message);
+        console.error('[WhatsApp] Discovery via debug_token failed:', discoverErr.message);
       }
 
       if (!wabaId || !phoneNumberId) {
