@@ -3467,9 +3467,10 @@ app.post('/api/whatsapp/reply', authenticateToken, requireIdempotencyKey, async 
 // them here alongside the code).
 app.post('/api/whatsapp/connect', authenticateToken, async (req, res) => {
   try {
-    const { code, wabaId, phoneNumberId } = req.body;
-    if (!code || !wabaId || !phoneNumberId) {
-      return res.status(400).json({ error: 'Missing code, wabaId, or phoneNumberId from the signup flow.' });
+    const { code } = req.body;
+    let { wabaId, phoneNumberId } = req.body;
+    if (!code) {
+      return res.status(400).json({ error: 'Missing authorization code from the signup flow.' });
     }
 
     // Step 1: exchange the authorization code for a short-lived token.
@@ -3493,6 +3494,62 @@ app.post('/api/whatsapp/connect', authenticateToken, async (req, res) => {
     if (!longLivedRes.ok || !longLivedData.access_token) {
       console.error('[WhatsApp] Long-lived token exchange failed:', longLivedData);
       return res.status(400).json({ error: 'Failed to obtain a long-lived access token.' });
+    }
+
+    // Step 2b: fall back to discovering wabaId/phoneNumberId via Graph API
+    // when the frontend didn't capture them from Meta's WA_EMBEDDED_SIGNUP
+    // postMessage event. Confirmed (2026-09-27) that postMessage is only
+    // reliably emitted by the full new-number onboarding wizard — when a
+    // business shares an EXISTING, already-verified WABA/number through
+    // Meta's simpler "select business assets to share" consent screen
+    // instead, no WA_EMBEDDED_SIGNUP event fires at all, in any browser
+    // (verified against two independent browsers, ruling out a
+    // browser/extension blocking theory). The long-lived token's
+    // visibility is already scoped to exactly what was granted in that
+    // consent screen, so walking /me/businesses -> owned WABAs -> phone
+    // numbers is unambiguous, not a guess across unrelated assets.
+    if (!wabaId || !phoneNumberId) {
+      console.log('[WhatsApp] wabaId/phoneNumberId not supplied by frontend — discovering via Graph API.');
+      try {
+        const bizRes = await fetch(
+          `https://graph.facebook.com/v19.0/me/businesses?access_token=${longLivedData.access_token}`
+        );
+        const bizData = await bizRes.json();
+        console.log('[WhatsApp] Discovery — businesses visible to this token:', JSON.stringify(bizData));
+
+        outer:
+        for (const business of bizData?.data || []) {
+          const wabaRes = await fetch(
+            `https://graph.facebook.com/v19.0/${business.id}/owned_whatsapp_business_accounts?access_token=${longLivedData.access_token}`
+          );
+          const wabaData = await wabaRes.json();
+          console.log(`[WhatsApp] Discovery — WABAs owned by business ${business.id}:`, JSON.stringify(wabaData));
+
+          for (const waba of wabaData?.data || []) {
+            const numbersRes = await fetch(
+              `https://graph.facebook.com/v19.0/${waba.id}/phone_numbers?access_token=${longLivedData.access_token}`
+            );
+            const numbersData = await numbersRes.json();
+            console.log(`[WhatsApp] Discovery — phone numbers on WABA ${waba.id}:`, JSON.stringify(numbersData));
+
+            const firstNumber = numbersData?.data?.[0];
+            if (firstNumber?.id) {
+              wabaId = waba.id;
+              phoneNumberId = firstNumber.id;
+              break outer;
+            }
+          }
+        }
+      } catch (discoverErr) {
+        console.error('[WhatsApp] Discovery via Graph API failed:', discoverErr.message);
+      }
+
+      if (!wabaId || !phoneNumberId) {
+        return res.status(400).json({
+          error: 'Could not determine which WhatsApp Business Account or phone number was granted. Please try connecting again.',
+        });
+      }
+      console.log(`[WhatsApp] Discovery resolved wabaId=${wabaId}, phoneNumberId=${phoneNumberId}.`);
     }
 
     // Step 3: subscribe this app to the customer's WABA — without this,
