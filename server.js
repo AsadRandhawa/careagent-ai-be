@@ -87,6 +87,28 @@ const authLimiter = rateLimit({
   message: { error: 'Too many attempts. Please try again later.' },
 });
 
+// Public, unauthenticated endpoints that each trigger a paid OpenAI call
+// (website chat widget + landing-page guide bot). Without a limit, anyone
+// who copies a business's widget token, or finds /api/chat, can send
+// unlimited messages and run up the OpenAI bill. Keyed by IP.
+const publicChatLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  limit: 20,           // 20 messages per minute per IP, far above a real visitor's typing speed
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many messages. Please wait a moment and try again.' },
+});
+// The widget polls every 3 seconds (20/min) while a chat is open; this
+// leaves room for a few tabs on one IP without letting a script hammer it.
+const livechatPollLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests.' },
+});
+const MAX_CHAT_MESSAGE_CHARS = 2000;
+
 const prisma = new PrismaClient();
 
 // ── (removed) External RAG routing ──────────────────────────────────────────
@@ -2029,16 +2051,29 @@ app.post('/api/ai/draft', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/chat', async (req, res) => {
+app.post('/api/chat', publicChatLimiter, async (req, res) => {
   try {
     const { messages, system } = req.body;
-    const fullMessages = system
-      ? [{ role: 'system', content: system }, ...messages]
-      : messages;
+    // Public endpoint behind the landing-page guide bot. Bound everything a
+    // caller can send so it can't be used as an unlimited free ChatGPT:
+    // only user/assistant turns, the last 12 of them, each capped in length,
+    // a capped system prompt, and a capped reply length.
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'messages required' });
+    }
+    const safeMessages = messages
+      .filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+      .slice(-12)
+      .map(m => ({ role: m.role, content: m.content.slice(0, MAX_CHAT_MESSAGE_CHARS) }));
+    if (safeMessages.length === 0) return res.status(400).json({ error: 'messages required' });
+    const fullMessages = typeof system === 'string' && system.trim()
+      ? [{ role: 'system', content: system.slice(0, 6000) }, ...safeMessages]
+      : safeMessages;
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: fullMessages,
       temperature: 0.7,
+      max_tokens: 400,
     });
     res.json({ reply: response.choices[0]?.message?.content || '' });
   } catch (error) {
@@ -3637,15 +3672,15 @@ var _A='${API}',_sc=document.currentScript||[...document.querySelectorAll('scrip
 if(!_sc)return;
 var _tok=_sc.getAttribute('data-token'),_nm=_sc.getAttribute('data-name')||'Support',_col=_sc.getAttribute('data-color')||'#3B82F6';
 if(!_tok)return;
-var _sid=localStorage.getItem('_ca_sid_'+_tok),_vid=localStorage.getItem('_ca_vid')||(function(){var v='v_'+Math.random().toString(36).substr(2,9);localStorage.setItem('_ca_vid',v);return v;})(),_vname=localStorage.getItem('_ca_nm_'+_tok)||'',_named=!!_vname,_open=false,_last=null,_poll=null,_unread=0;
+var _sid=localStorage.getItem('_ca_sid_'+_tok),_vid=localStorage.getItem('_ca_vid')||(function(){var v='v_'+((window.crypto&&window.crypto.randomUUID)?window.crypto.randomUUID():(Date.now().toString(36)+Math.random().toString(36).slice(2)+Math.random().toString(36).slice(2)));localStorage.setItem('_ca_vid',v);return v;})(),_vname=localStorage.getItem('_ca_nm_'+_tok)||'',_named=!!_vname,_open=false,_last=null,_poll=null,_unread=0;
 var _css='.ca-w{position:fixed;bottom:24px;right:24px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}.ca-btn{width:56px;height:56px;border-radius:50%;background:'+_col+';border:none;cursor:pointer;box-shadow:0 4px 20px rgba(0,0,0,.2);display:flex;align-items:center;justify-content:center;transition:transform .2s;position:relative}.ca-btn:hover{transform:scale(1.08)}.ca-bdg{position:absolute;top:-3px;right:-3px;background:#EF4444;color:#fff;border-radius:50%;min-width:18px;height:18px;font-size:10px;font-weight:700;display:none;align-items:center;justify-content:center;padding:0 3px}.ca-pnl{position:absolute;bottom:68px;right:0;width:340px;height:500px;background:#fff;border-radius:16px;box-shadow:0 12px 48px rgba(0,0,0,.18);display:flex;flex-direction:column;overflow:hidden;transition:transform .25s cubic-bezier(.4,0,.2,1),opacity .25s;transform-origin:bottom right}.ca-pnl.off{transform:scale(.9) translateY(8px);opacity:0;pointer-events:none}.ca-hd{background:'+_col+';padding:14px 16px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}.ca-ht{color:#fff;font-size:15px;font-weight:600;margin:0}.ca-hs{color:rgba(255,255,255,.75);font-size:11px;margin:2px 0 0}.ca-cx{background:none;border:none;cursor:pointer;color:#fff;opacity:.8;padding:4px;border-radius:6px;display:flex}.ca-cx:hover{opacity:1;background:rgba(255,255,255,.15)}.ca-ms{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}.ca-ms::-webkit-scrollbar{width:4px}.ca-ms::-webkit-scrollbar-thumb{background:#E5E7EB;border-radius:4px}.ca-mg{max-width:82%;display:flex;flex-direction:column}.ca-mg.v{align-self:flex-end;align-items:flex-end}.ca-mg.a{align-self:flex-start;align-items:flex-start}.ca-bb{padding:9px 13px;border-radius:14px;font-size:13px;line-height:1.45;word-break:break-word}.ca-mg.v .ca-bb{background:'+_col+';color:#fff;border-bottom-right-radius:4px}.ca-mg.a .ca-bb{background:#F3F4F6;color:#111827;border-bottom-left-radius:4px}.ca-ts{font-size:10px;color:#9CA3AF;margin-top:3px}.ca-nf{padding:12px 14px;border-top:1px solid #F3F4F6;flex-shrink:0}.ca-nf p{font-size:12px;color:#6B7280;margin:0 0 6px}.ca-nr{display:flex;gap:8px}.ca-ni{flex:1;border:1px solid #E5E7EB;border-radius:8px;padding:8px 10px;font-size:13px;outline:none;font-family:inherit}.ca-ni:focus{border-color:'+_col+'}.ca-ia{padding:10px 12px;border-top:1px solid #F3F4F6;display:flex;gap:8px;align-items:flex-end;flex-shrink:0}.ca-inp{flex:1;border:1px solid #E5E7EB;border-radius:10px;padding:8px 11px;font-size:13px;outline:none;resize:none;height:38px;max-height:96px;font-family:inherit;transition:border-color .15s;line-height:1.4}.ca-inp:focus{border-color:'+_col+'}.ca-sb{width:36px;height:36px;min-width:36px;border-radius:10px;background:'+_col+';border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:opacity .15s}.ca-sb:hover{opacity:.85}.ca-em{text-align:center;padding:32px 14px}.ca-em svg{margin:0 auto;display:block}.ca-em p{color:#9CA3AF;font-size:13px;line-height:1.6;margin:10px 0 0}';
 var _s=document.createElement('style');_s.textContent=_css;document.head.appendChild(_s);
 var _c=document.createElement('div');_c.className='ca-w';
-_c.innerHTML='<div class="ca-pnl off"><div class="ca-hd"><div><p class="ca-ht">'+_nm+'</p><p class="ca-hs">Typically replies in minutes</p></div><button class="ca-cx" id="_ca_cx"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div><div class="ca-ms" id="_ca_ms"><div class="ca-em" id="_ca_em"><svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="'+_col+'" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><p>Hi! How can we help you today?</p></div></div><div class="ca-nf" id="_ca_nf" style="display:'+(_named?'none':'block')+'"><p>What's your name?</p><div class="ca-nr"><input class="ca-ni" id="_ca_ni" placeholder="Your name..." /><button class="ca-sb" id="_ca_ns"><svg width="15" height="15" viewBox="0 0 24 24" fill="white"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg></button></div></div><div class="ca-ia" id="_ca_ia" style="display:'+(_named?'flex':'none')+'"><textarea class="ca-inp" id="_ca_inp" placeholder="Type a message..." rows="1"></textarea><button class="ca-sb" id="_ca_sd"><svg width="15" height="15" viewBox="0 0 24 24" fill="white"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg></button></div></div><button class="ca-btn" id="_ca_btn"><div class="ca-bdg" id="_ca_bdg"></div><svg id="_ca_ic" width="22" height="22" viewBox="0 0 24 24" fill="white"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><svg id="_ca_ix" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" style="display:none"><path d="M18 6L6 18M6 6l12 12"/></svg></button>';
+_c.innerHTML='<div class="ca-pnl off"><div class="ca-hd"><div><p class="ca-ht">'+_nm+'</p><p class="ca-hs">Typically replies in minutes</p></div><button class="ca-cx" id="_ca_cx"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div><div class="ca-ms" id="_ca_ms"><div class="ca-em" id="_ca_em"><svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="'+_col+'" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><p>Hi! How can we help you today?</p></div></div><div class="ca-nf" id="_ca_nf" style="display:'+(_named?'none':'block')+'"><p>What is your name?</p><div class="ca-nr"><input class="ca-ni" id="_ca_ni" placeholder="Your name..." /><button class="ca-sb" id="_ca_ns"><svg width="15" height="15" viewBox="0 0 24 24" fill="white"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg></button></div></div><div class="ca-ia" id="_ca_ia" style="display:'+(_named?'flex':'none')+'"><textarea class="ca-inp" id="_ca_inp" placeholder="Type a message..." rows="1"></textarea><button class="ca-sb" id="_ca_sd"><svg width="15" height="15" viewBox="0 0 24 24" fill="white"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg></button></div></div><button class="ca-btn" id="_ca_btn"><div class="ca-bdg" id="_ca_bdg"></div><svg id="_ca_ic" width="22" height="22" viewBox="0 0 24 24" fill="white"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><svg id="_ca_ix" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" style="display:none"><path d="M18 6L6 18M6 6l12 12"/></svg></button>';
 document.body.appendChild(_c);
 var _$=function(id){return document.getElementById(id);};
 function _ft(ts){return new Date(ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
-function _rm(m){var d=document.createElement('div');d.className='ca-mg '+(m.role==='visitor'?'v':'a');d.innerHTML='<div class="ca-bb">'+m.content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>')+'</div><div class="ca-ts">'+_ft(m.createdAt)+'</div>';return d;}
+function _rm(m){var d=document.createElement('div');d.className='ca-mg '+(m.role==='visitor'?'v':'a');d.innerHTML='<div class="ca-bb">'+m.content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\\n/g,'<br>')+'</div><div class="ca-ts">'+_ft(m.createdAt)+'</div>';return d;}
 function _add(m){var ms=_$('_ca_ms'),em=_$('_ca_em');if(em)em.remove();ms.appendChild(_rm(m));ms.scrollTop=ms.scrollHeight;}
 function _bdg(n){_unread=n;var b=_$('_ca_bdg');if(n>0&&!_open){b.textContent=n>9?'9+':n;b.style.display='flex';}else{b.style.display='none';}}
 async function _is(){try{var r=await fetch(_A+'/api/livechat/session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({livechatToken:_tok,visitorId:_vid,visitorName:_vname})});var d=await r.json();_sid=d.sessionId;localStorage.setItem('_ca_sid_'+_tok,_sid);(d.messages||[]).forEach(function(m){_add(m);});if(d.messages&&d.messages.length)_last=d.messages[d.messages.length-1].createdAt;_sp();}catch(e){console.error('[CA]',e);}}
@@ -3684,10 +3719,14 @@ app.post('/api/livechat/token', authenticateToken, async (req, res) => {
 });
 
 // POST /api/livechat/session — create/resume session (public)
-app.post('/api/livechat/session', async (req, res) => {
+app.post('/api/livechat/session', publicChatLimiter, async (req, res) => {
   try {
-    const { livechatToken, visitorId, visitorName } = req.body;
+    const { livechatToken, visitorId } = req.body;
     if (!livechatToken || !visitorId) return res.status(400).json({ error: 'livechatToken and visitorId required' });
+    if (typeof livechatToken !== 'string' || typeof visitorId !== 'string' || visitorId.length > 100) {
+      return res.status(400).json({ error: 'Invalid session request' });
+    }
+    const visitorName = typeof req.body.visitorName === 'string' ? req.body.visitorName.trim().slice(0, 80) : '';
     const user = await prisma.user.findUnique({ where: { livechatToken } });
     if (!user) return res.status(404).json({ error: 'Invalid token' });
     let session = await prisma.chatSession.findFirst({
@@ -3708,10 +3747,13 @@ app.post('/api/livechat/session', async (req, res) => {
 });
 
 // POST /api/livechat/message — visitor sends message (public)
-app.post('/api/livechat/message', async (req, res) => {
+app.post('/api/livechat/message', publicChatLimiter, async (req, res) => {
   try {
     const { sessionId, content } = req.body;
-    if (!sessionId || !content?.trim()) return res.status(400).json({ error: 'sessionId and content required' });
+    if (!sessionId || typeof content !== 'string' || !content.trim()) return res.status(400).json({ error: 'sessionId and content required' });
+    if (content.length > MAX_CHAT_MESSAGE_CHARS) {
+      return res.status(400).json({ error: `Message is too long (max ${MAX_CHAT_MESSAGE_CHARS} characters).` });
+    }
     const session = await prisma.chatSession.findUnique({ where: { id: sessionId }, include: { user: true } });
     if (!session) return res.status(404).json({ error: 'Session not found' });
     const message = await prisma.chatMessage.create({ data: { sessionId, role: 'visitor', content: content.trim() } });
@@ -3729,7 +3771,7 @@ app.post('/api/livechat/message', async (req, res) => {
 });
 
 // GET /api/livechat/poll/:sessionId — visitor polls for agent replies (public)
-app.get('/api/livechat/poll/:sessionId', async (req, res) => {
+app.get('/api/livechat/poll/:sessionId', livechatPollLimiter, async (req, res) => {
   try {
     const { after } = req.query;
     const messages = await prisma.chatMessage.findMany({
