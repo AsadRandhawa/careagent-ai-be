@@ -368,19 +368,24 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
 app.post('/api/user/knowledge-base', authenticateToken, async (req, res) => {
   try {
     const { documents, businessIdentity, brandVoice } = req.body;
+    // Read the previous document list first, so only documents that were
+    // actually added, changed or removed get re-indexed below.
+    const before = await prisma.user.findUnique({
+      where: { id: req.user.userId },
+      select: { documents: true },
+    });
     await prisma.user.update({
       where: { id: req.user.userId },
       data: { documents: documents || [], businessIdentity, brandVoice }
     });
 
-    // Re-chunk and re-embed for RAG. Best-effort: if embedding fails (e.g.
-    // OpenAI outage), the document metadata above is already saved — don't
-    // fail the whole request just because retrieval indexing couldn't run;
-    // /api/ai/draft degrades gracefully to "no relevant KB content found"
-    // in that case rather than erroring.
+    // Update the search index for changed documents only. Best-effort: if
+    // embedding fails (e.g. OpenAI outage), the document list above is
+    // already saved — the per-document result tells the page which
+    // documents didn't index, instead of failing the whole save.
     let reindexResult = null;
     try {
-      reindexResult = await reindexKnowledgeBase(req.user.userId, documents);
+      reindexResult = await syncKnowledgeBaseIndex(req.user.userId, before?.documents, documents);
     } catch (reindexErr) {
       console.error('[knowledge-base] Reindex failed:', reindexErr.message);
     }
@@ -388,6 +393,32 @@ app.post('/api/user/knowledge-base', authenticateToken, async (req, res) => {
     res.json({ success: true, reindexed: reindexResult });
   } catch (err) {
     res.status(500).json({ error: 'Failed to update knowledge base' });
+  }
+});
+
+// GET — what the AI can actually search right now: real passage counts per
+// document and when each was last indexed, read straight from the search
+// index. Priority Facts are excluded (they have their own screen).
+app.get('/api/user/knowledge-base/index-status', authenticateToken, async (req, res) => {
+  try {
+    const rows = await prisma.$queryRaw`
+      SELECT "docName", COUNT(*)::int AS "chunks", MAX("createdAt") AS "indexedAt"
+      FROM "DocumentChunk"
+      WHERE "userId" = ${req.user.userId} AND "triggerPattern" IS NULL
+      GROUP BY "docName"
+    `;
+    const docs = rows.map(r => ({
+      name: r.docName,
+      chunks: Number(r.chunks) || 0,
+      indexedAt: r.indexedAt ? new Date(r.indexedAt).toISOString() : null,
+    }));
+    const totalChunks = docs.reduce((sum, d) => sum + d.chunks, 0);
+    const lastIndexedAt = docs.reduce((latest, d) => (!latest || (d.indexedAt && d.indexedAt > latest) ? d.indexedAt : latest), null);
+    res.set('Cache-Control', 'no-store');
+    res.json({ docs, totalChunks, lastIndexedAt });
+  } catch (err) {
+    console.error('[knowledge-base/index-status]', err.message);
+    res.status(500).json({ error: 'Failed to load index status' });
   }
 });
 
@@ -1156,19 +1187,9 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
     const userId = req.user.userId;
 
-    // Get live Gmail inbox count — Gmail's true "open" state lives in the
-    // Gmail inbox itself (a Ticket row only exists once synced/replied to),
-    // so this is the only channel that needs a live API call rather than a
-    // DB count.
-    let gmailOpenCount = 0;
-    try {
-      const user = await prisma.user.findUnique({ where: { id: userId } });
-      if (user?.googleTokens && user?.gmailEnabled !== false) {
-        const gmailClient = google.gmail({ version: 'v1', auth: getUserOAuth(user.googleTokens) });
-        const gmailRes = await gmailClient.users.messages.list({ userId: 'me', maxResults: 1, q: 'in:inbox' });
-        gmailOpenCount = gmailRes.data.resultSizeEstimate || 0;
-      }
-    } catch (e) { console.error('Gmail count error:', e.message); }
+    // Gmail is no longer counted here: it used Gmail's whole-inbox size
+    // estimate (every email, read or not), which isn't "open tickets", and
+    // Gmail is being removed from the product.
 
     const [
       resolvedThisPeriod, escalated, escalatedThisPeriod, volumeTrend,
@@ -1210,8 +1231,18 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
       // would show "0 Open Tickets" no matter how much real activity it had.
       prisma.ticket.count({ where: { userId, channel: { not: 'gmail' }, status: 'new' } }),
       // Website Live Chat doesn't use the Ticket table at all — its
-      // "tickets" come from ChatSession, so it needs its own count.
-      prisma.chatSession.count({ where: { userId, status: 'active' } }),
+      // "tickets" come from ChatSession. A chat only counts as open when
+      // it's actually waiting on the business: not escalated, and the last
+      // message is from the visitor. Previously every active session
+      // counted, including chats the AI had already answered and old test
+      // chats, which inflated Open Tickets.
+      prisma.chatSession.findMany({
+        where: { userId, status: 'active' },
+        select: {
+          escalated: true,
+          messages: { orderBy: { createdAt: 'desc' }, take: 1, select: { role: true } },
+        },
+      }),
       // For avg resolution time: every ticket resolved in this period that
       // actually has both timestamps needed to compute a duration.
       prisma.ticket.findMany({
@@ -1236,7 +1267,14 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
       }),
     ]);
 
-    const openTickets = gmailOpenCount + nonGmailOpenTickets + activeLivechatSessions;
+    const waitingLivechatSessions = activeLivechatSessions.filter(
+      s => !s.escalated && s.messages[0]?.role === 'visitor'
+    ).length;
+    // Escalated website chats need a human just like escalated tickets, so
+    // they belong in the escalated count rather than disappearing.
+    const escalatedLivechatSessions = activeLivechatSessions.filter(s => s.escalated).length;
+    const openTickets = nonGmailOpenTickets + waitingLivechatSessions;
+    const escalatedTotal = escalated + escalatedLivechatSessions;
     const resolvedCount = (Number.isFinite(resolvedThisPeriod) ? resolvedThisPeriod : 0);
 
     // Escalation rate: of every conversation that reached a real outcome
@@ -1245,16 +1283,19 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
     // a still-open ticket hasn't reached either outcome yet, so including
     // it would dilute the rate with conversations that aren't decided.
     // Both sides of this ratio are now scoped to the same `since` window.
+    // Below MIN_SAMPLE decided conversations a percentage is noise (1 of 2
+    // = "50%"), so show a dash until there's enough data to mean something.
+    const MIN_SAMPLE = 5;
     const decidedThisPeriod = resolvedCount + escalatedThisPeriod;
-    const escalationRate = decidedThisPeriod > 0
+    const escalationRate = decidedThisPeriod >= MIN_SAMPLE
       ? ((escalatedThisPeriod / decidedThisPeriod) * 100).toFixed(1) + '%'
-      : '0.0%';
+      : '—';
 
     // Average resolution time — mean of (resolvedAt - receivedAt) across
     // every ticket actually resolved in this period. Previously this was
     // hardcoded to the literal string 'N/A' and never computed at all.
-    let avgResolutionTime = 'N/A';
-    if (resolvedForAvgTime.length > 0) {
+    let avgResolutionTime = '—';
+    if (resolvedForAvgTime.length >= MIN_SAMPLE) {
       const totalMs = resolvedForAvgTime.reduce((sum, t) => {
         const ms = new Date(t.resolvedAt) - new Date(t.receivedAt);
         return sum + (Number.isFinite(ms) && ms > 0 ? ms : 0);
@@ -1291,7 +1332,7 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
     res.json({
       openTickets:        parseInt(openTickets) || 0,
       resolvedThisPeriod: parseInt(resolvedCount) || 0,
-      escalated:          parseInt(escalated) || 0,
+      escalated:          parseInt(escalatedTotal) || 0,
       escalationRate,
       avgResolutionTime,
       // NOTE: there's no real tracked signal yet for "has an AI draft
@@ -1474,6 +1515,83 @@ async function embedText(text) {
 // this will make that save request slow, since each chunk is a separate
 // embedding API call; moving this to a background job/queue is the right
 // next step once KB sizes grow, flagged separately rather than solved here.
+// Incremental version of reindexKnowledgeBase(): compares the previous and
+// new document lists by name and text, and only touches what changed.
+//   - new or edited document  -> its old passages are replaced
+//   - removed document        -> its passages are deleted
+//   - unchanged document      -> left alone (no embedding cost)
+// An unchanged document is still indexed if it has text but no passages
+// yet (e.g. a previous attempt failed). Documents that exist only in the
+// index (added by import scripts, with no text stored on the account) are
+// never touched here, so routine uploads can't wipe them.
+// Priority Facts (triggerPattern set) are never touched either.
+async function syncKnowledgeBaseIndex(userId, previousDocuments, documents) {
+  const textHash = (t) => crypto.createHash('sha256').update(t || '').digest('hex');
+  const prev = new Map();
+  for (const d of (Array.isArray(previousDocuments) ? previousDocuments : [])) {
+    if (d?.name) prev.set(d.name, textHash(d.textContent));
+  }
+  const next = (Array.isArray(documents) ? documents : []).filter(d => d?.name);
+  const nextNames = new Set(next.map(d => d.name));
+
+  const counts = await prisma.$queryRaw`
+    SELECT "docName", COUNT(*)::int AS "chunks"
+    FROM "DocumentChunk"
+    WHERE "userId" = ${userId} AND "triggerPattern" IS NULL
+    GROUP BY "docName"
+  `;
+  const indexedCount = new Map(counts.map(r => [r.docName, Number(r.chunks) || 0]));
+
+  const results = [];
+  const removed = [];
+  let unchanged = 0;
+
+  // Documents removed from the list: drop their passages.
+  for (const name of prev.keys()) {
+    if (nextNames.has(name)) continue;
+    await prisma.$executeRaw`DELETE FROM "DocumentChunk" WHERE "userId" = ${userId} AND "docName" = ${name} AND "triggerPattern" IS NULL`;
+    removed.push(name);
+  }
+
+  for (const doc of next) {
+    const text = (doc.textContent || '').trim();
+    const isNew = !prev.has(doc.name);
+    const changed = !isNew && prev.get(doc.name) !== textHash(doc.textContent);
+    const missingFromIndex = !!text && !indexedCount.get(doc.name);
+    if (!isNew && !changed && !missingFromIndex) { unchanged++; continue; }
+
+    // A document with no stored text but existing passages came from an
+    // import script — keep its passages rather than deleting them.
+    if (!text && indexedCount.get(doc.name)) { unchanged++; continue; }
+
+    await prisma.$executeRaw`DELETE FROM "DocumentChunk" WHERE "userId" = ${userId} AND "docName" = ${doc.name} AND "triggerPattern" IS NULL`;
+    if (!text) {
+      results.push({ name: doc.name, chunks: 0, failed: 0, empty: true });
+      continue;
+    }
+
+    let stored = 0, failed = 0;
+    for (const chunk of chunkText(text)) {
+      try {
+        const embedding = await embedText(chunk);
+        const vectorLiteral = `[${embedding.join(',')}]`;
+        await prisma.$executeRaw`
+          INSERT INTO "DocumentChunk" ("id", "userId", "docName", "content", "embedding", "createdAt")
+          VALUES (gen_random_uuid(), ${userId}, ${doc.name}, ${chunk}, ${vectorLiteral}::vector, NOW())
+        `;
+        stored++;
+      } catch (err) {
+        failed++;
+        console.error(`[RAG] Failed to embed a chunk of "${doc.name}":`, err.message);
+      }
+    }
+    results.push({ name: doc.name, chunks: stored, failed, empty: false });
+  }
+
+  console.log(`[RAG] Index sync for user ${userId}: ${results.length} indexed, ${removed.length} removed, ${unchanged} unchanged`);
+  return { indexed: results, removed, unchanged };
+}
+
 async function reindexKnowledgeBase(userId, documents) {
   // Only clears ordinary chunks — curated-fact chunks (triggerPattern set)
   // are seeded separately (see scripts/migrate-leads-curated-facts.js) and
@@ -3870,6 +3988,33 @@ app.post('/api/livechat/resolve', authenticateToken, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ── Auto-close idle website chats ─────────────────────────────
+// A website chat otherwise stays "active" forever unless someone clicks
+// resolve, so answered and abandoned chats pile up in the Inbox and in
+// Open Tickets. Once an hour, close any active chat with no activity for
+// 24 hours. Escalated chats are left alone: they still need a human.
+// A returning visitor simply starts a fresh chat.
+const LIVECHAT_IDLE_CLOSE_MS = 24 * 60 * 60 * 1000;
+async function closeIdleLivechatSessions() {
+  try {
+    const result = await prisma.chatSession.updateMany({
+      where: {
+        status: 'active',
+        escalated: false,
+        updatedAt: { lt: new Date(Date.now() - LIVECHAT_IDLE_CLOSE_MS) },
+      },
+      data: { status: 'resolved' },
+    });
+    if (result.count > 0) console.log(`[Livechat] Auto-closed ${result.count} idle chat session(s).`);
+  } catch (err) {
+    console.error('[Livechat] Auto-close failed:', err.message);
+  }
+}
+if (process.env.NODE_ENV !== 'test') {
+  closeIdleLivechatSessions();
+  setInterval(closeIdleLivechatSessions, 60 * 60 * 1000).unref();
+}
 
 const PORT = process.env.PORT || 5000;
 // Only actually bind to a port when this file is run directly (Railway's
