@@ -126,7 +126,68 @@ const openai = new OpenAI({
   apiKey: process.env.VITE_OPENAI_API_KEY || process.env.OPENAI_API_KEY
 });
 
+// ── AI reply gate: suspension + monthly allowance ─────────
+// Every AI reply in the app goes through generateNativeDraft(), so this is
+// the one place that blocks suspended clients and clients who used up their
+// monthly allowance, and counts usage. Callers on the auto-reply paths
+// already fail closed on any thrown error (the message is left for a human),
+// so a blocked reply simply is not sent.
+async function generateNativeDraft(userId, options) {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { suspended: true, plan: true, replyLimitOverride: true },
+  });
+  if (user?.suspended) {
+    throw new AiBlockedError('suspended', 'AI replies are turned off because this account is suspended.');
+  }
+  const month = currentUsageMonth();
+  const limit = effectiveReplyLimit(user);
+  if (limit != null) {
+    const usage = await prisma.aiUsage.findUnique({
+      where: { userId_month: { userId, month } },
+      select: { aiReplies: true },
+    });
+    if ((usage?.aiReplies ?? 0) >= limit) {
+      throw new AiBlockedError('limit', `This account has used all ${limit.toLocaleString()} AI replies for this month. Upgrade the plan to keep AI replies running.`);
+    }
+  }
+
+  const result = await generateNativeDraftInner(userId, options);
+
+  // Count only successful generations. A failure here must never break the
+  // reply itself, so it is logged and swallowed.
+  try {
+    await prisma.aiUsage.upsert({
+      where:  { userId_month: { userId, month } },
+      create: { userId, month, aiReplies: 1 },
+      update: { aiReplies: { increment: 1 } },
+    });
+  } catch (err) {
+    console.error('[AiUsage] Failed to record usage:', err.message);
+  }
+  return result;
+}
+
 // ── Auth middleware ────────────────────────────────────────
+// Suspended accounts are blocked on every authenticated request, not just at
+// login, so suspending a client takes effect within a minute even if they
+// are already signed in. The lookup is cached per user for 60 seconds to
+// avoid a database read on every request; the admin endpoints clear the
+// cache entry immediately when they change a client's status.
+const SUSPENSION_CACHE_TTL_MS = 60 * 1000;
+const suspensionCache = new Map(); // userId -> { suspended, at }
+
+async function isUserSuspended(userId) {
+  const hit = suspensionCache.get(userId);
+  if (hit && Date.now() - hit.at < SUSPENSION_CACHE_TTL_MS) return hit.suspended;
+  const row = await prisma.user.findUnique({ where: { id: userId }, select: { suspended: true } });
+  const suspended = !!row?.suspended;
+  suspensionCache.set(userId, { suspended, at: Date.now() });
+  return suspended;
+}
+
+const SUSPENDED_MESSAGE = 'This account has been suspended. Contact flintsol.internal@gmail.com for help.';
+
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -134,9 +195,52 @@ const authenticateToken = (req, res, next) => {
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) return res.sendStatus(403);
     req.user = user;
-    next();
+    isUserSuspended(user.userId)
+      .then(suspended => {
+        if (suspended) return res.status(403).json({ error: SUSPENDED_MESSAGE, suspended: true });
+        next();
+      })
+      // Fail open on a database hiccup: a transient DB error should not
+      // lock every client out of the app. Suspension is still enforced at
+      // login and on every AI reply.
+      .catch(() => next());
   });
 };
+
+// ── Super admin ─────────────────────────────────────────────
+// Super admins are defined ONLY by the SUPER_ADMIN_EMAILS environment
+// variable on Railway (comma-separated). There is deliberately no way to
+// grant this from inside the app or the database.
+const SUPER_ADMIN_EMAILS = new Set(
+  (process.env.SUPER_ADMIN_EMAILS || '')
+    .split(',')
+    .map(e => e.trim().toLowerCase())
+    .filter(Boolean)
+);
+const isSuperAdminEmail = (email) => !!email && SUPER_ADMIN_EMAILS.has(String(email).toLowerCase());
+
+// ── Plans and AI reply allowances ───────────────────────────
+// null = no monthly cap. 'startup' is the legacy default every existing
+// account has; it is left uncapped so turning this on does not cut off any
+// live client. Set a per-client limit from the admin dashboard instead.
+const PLAN_REPLY_LIMITS = { startup: null, starter: 1500, growth: 6000, managed: null };
+const VALID_PLANS = Object.keys(PLAN_REPLY_LIMITS);
+
+const currentUsageMonth = () => new Date().toISOString().slice(0, 7); // "YYYY-MM", UTC
+
+const effectiveReplyLimit = (user) => {
+  if (user?.replyLimitOverride != null) return user.replyLimitOverride;
+  const planLimit = PLAN_REPLY_LIMITS[user?.plan ?? 'startup'];
+  return planLimit === undefined ? null : planLimit;
+};
+
+class AiBlockedError extends Error {
+  constructor(reason, message) {
+    super(message);
+    this.name = 'AiBlockedError';
+    this.reason = reason; // 'suspended' | 'limit'
+  }
+}
 
 // ── Idempotency middleware ──────────────────────────────────
 // Guards endpoints that cause a real, external, non-repeatable side effect
@@ -294,6 +398,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     if (!user) return res.status(400).json({ error: 'Invalid credentials' });
     const validPassword = await bcrypt.compare(password, user.password);
     if (!validPassword) return res.status(400).json({ error: 'Invalid credentials' });
+    if (user.suspended) return res.status(403).json({ error: SUSPENDED_MESSAGE, suspended: true });
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_TTL });
     res.json({ token });
   } catch (err) {
@@ -326,6 +431,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
       id: user.id,
       email: user.email,
       plan: user.plan ?? 'startup',
+      isSuperAdmin: isSuperAdminEmail(user.email),
       googleConnected:    !!user.googleTokens,
       facebookConnected:  user.facebookConnected  ?? false,
       facebookPageName:   user.facebookPageName    ?? null,
@@ -1178,6 +1284,229 @@ app.post('/api/tickets/sync', authenticateToken, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
+// SUPER ADMIN — platform-wide view and control of client accounts
+// ═══════════════════════════════════════════════════════════
+// Every route here is behind requireSuperAdmin. A non-admin gets a plain
+// 404, so the routes don't even reveal that an admin area exists. Responses
+// never include passwords, access tokens or knowledge-base contents.
+
+const requireSuperAdmin = [
+  authenticateToken,
+  async (req, res, next) => {
+    try {
+      const me = await prisma.user.findUnique({ where: { id: req.user.userId }, select: { email: true } });
+      if (!isSuperAdminEmail(me?.email)) return res.status(404).json({ error: 'Not found' });
+      req.adminEmail = me.email;
+      next();
+    } catch (err) {
+      res.status(500).json({ error: 'Admin check failed' });
+    }
+  },
+];
+
+const ADMIN_USER_SELECT = {
+  id: true, email: true, plan: true, createdAt: true,
+  suspended: true, suspendedReason: true, suspendedAt: true, replyLimitOverride: true,
+  whatsappPhoneNumberId: true, whatsappToken: true,
+  facebookConnected: true, instagramConnected: true, livechatEnabled: true,
+  lastSeenInboxAt: true,
+};
+
+// Turns raw DB rows into the safe shape the admin screen uses. Tokens are
+// read only to compute a yes/no and are never sent to the browser.
+async function buildAdminClientRows(users) {
+  if (users.length === 0) return [];
+  const ids = users.map(u => u.id);
+  const month = currentUsageMonth();
+  const since30 = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+  const [usage, tickets30, sessions30, lastTicket, lastSession, passages] = await Promise.all([
+    prisma.aiUsage.findMany({ where: { userId: { in: ids }, month }, select: { userId: true, aiReplies: true } }),
+    prisma.ticket.groupBy({ by: ['userId'], where: { userId: { in: ids }, receivedAt: { gte: since30 } }, _count: { _all: true } }),
+    prisma.chatSession.groupBy({ by: ['userId'], where: { userId: { in: ids }, createdAt: { gte: since30 } }, _count: { _all: true } }),
+    prisma.ticket.groupBy({ by: ['userId'], where: { userId: { in: ids } }, _max: { receivedAt: true } }),
+    prisma.chatSession.groupBy({ by: ['userId'], where: { userId: { in: ids } }, _max: { updatedAt: true } }),
+    prisma.documentChunk.groupBy({ by: ['userId'], where: { userId: { in: ids } }, _count: { _all: true } }),
+  ]);
+
+  const byUser = (rows, pick) => new Map(rows.map(r => [r.userId, pick(r)]));
+  const usageMap    = byUser(usage, r => r.aiReplies);
+  const tickets30M  = byUser(tickets30, r => r._count._all);
+  const sessions30M = byUser(sessions30, r => r._count._all);
+  const lastTicketM = byUser(lastTicket, r => r._max.receivedAt);
+  const lastSessM   = byUser(lastSession, r => r._max.updatedAt);
+  const passagesM   = byUser(passages, r => r._count._all);
+
+  const latest = (...dates) => {
+    const t = dates.filter(Boolean).map(d => new Date(d).getTime());
+    return t.length ? new Date(Math.max(...t)).toISOString() : null;
+  };
+
+  return users.map(u => ({
+    id: u.id,
+    email: u.email,
+    plan: u.plan ?? 'startup',
+    createdAt: u.createdAt,
+    suspended: !!u.suspended,
+    suspendedReason: u.suspendedReason ?? null,
+    suspendedAt: u.suspendedAt ?? null,
+    replyLimitOverride: u.replyLimitOverride ?? null,
+    replyLimit: effectiveReplyLimit(u),
+    planReplyLimit: PLAN_REPLY_LIMITS[u.plan ?? 'startup'] ?? null,
+    aiRepliesThisMonth: usageMap.get(u.id) ?? 0,
+    conversations30d: (tickets30M.get(u.id) ?? 0) + (sessions30M.get(u.id) ?? 0),
+    knowledgePassages: passagesM.get(u.id) ?? 0,
+    lastActiveAt: latest(u.lastSeenInboxAt, lastTicketM.get(u.id), lastSessM.get(u.id)),
+    channels: {
+      whatsapp:  !!(u.whatsappPhoneNumberId && u.whatsappToken),
+      instagram: !!u.instagramConnected,
+      facebook:  !!u.facebookConnected,
+      website:   !!u.livechatEnabled,
+    },
+    isSuperAdmin: isSuperAdminEmail(u.email),
+  }));
+}
+
+// GET /api/admin/overview — headline numbers for the whole platform
+app.get('/api/admin/overview', requireSuperAdmin, async (req, res) => {
+  try {
+    const month = currentUsageMonth();
+    const monthStart = new Date(`${month}-01T00:00:00.000Z`);
+    const since30 = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    const [totalClients, suspended, newThisMonth, byPlan, usageSum, activeTicketUsers, activeSessionUsers] = await Promise.all([
+      prisma.user.count(),
+      prisma.user.count({ where: { suspended: true } }),
+      prisma.user.count({ where: { createdAt: { gte: monthStart } } }),
+      prisma.user.groupBy({ by: ['plan'], _count: { _all: true } }),
+      prisma.aiUsage.aggregate({ where: { month }, _sum: { aiReplies: true } }),
+      prisma.ticket.groupBy({ by: ['userId'], where: { receivedAt: { gte: since30 } } }),
+      prisma.chatSession.groupBy({ by: ['userId'], where: { createdAt: { gte: since30 } } }),
+    ]);
+
+    const active = new Set([...activeTicketUsers, ...activeSessionUsers].map(r => r.userId));
+
+    res.set('Cache-Control', 'no-store');
+    res.json({
+      totalClients,
+      activeClients30d: active.size,
+      suspended,
+      newThisMonth,
+      aiRepliesThisMonth: usageSum._sum.aiReplies ?? 0,
+      month,
+      byPlan: Object.fromEntries(byPlan.map(r => [r.plan ?? 'startup', r._count._all])),
+    });
+  } catch (err) {
+    console.error('[admin/overview]', err.message);
+    res.status(500).json({ error: 'Failed to load overview' });
+  }
+});
+
+// GET /api/admin/users?search= — every client with usage and status
+app.get('/api/admin/users', requireSuperAdmin, async (req, res) => {
+  try {
+    const search = typeof req.query.search === 'string' ? req.query.search.trim().slice(0, 100) : '';
+    const users = await prisma.user.findMany({
+      where: search ? { email: { contains: search, mode: 'insensitive' } } : undefined,
+      select: ADMIN_USER_SELECT,
+      orderBy: { createdAt: 'desc' },
+      take: 500,
+    });
+    res.set('Cache-Control', 'no-store');
+    res.json({ users: await buildAdminClientRows(users) });
+  } catch (err) {
+    console.error('[admin/users]', err.message);
+    res.status(500).json({ error: 'Failed to load clients' });
+  }
+});
+
+// PATCH /api/admin/users/:id — change plan, reply limit, or suspend/reactivate
+// Body (all optional): { plan, replyLimitOverride (number | null), suspended (bool), reason }
+app.patch('/api/admin/users/:id', requireSuperAdmin, async (req, res) => {
+  try {
+    const target = await prisma.user.findUnique({ where: { id: req.params.id }, select: ADMIN_USER_SELECT });
+    if (!target) return res.status(404).json({ error: 'Client not found' });
+
+    const { plan, replyLimitOverride, suspended, reason } = req.body || {};
+    const data = {};
+    const actions = [];
+
+    if (plan !== undefined) {
+      if (!VALID_PLANS.includes(plan)) return res.status(400).json({ error: 'Unknown plan' });
+      if (plan !== target.plan) {
+        data.plan = plan;
+        actions.push({ action: 'plan', details: { from: target.plan, to: plan } });
+      }
+    }
+
+    if (replyLimitOverride !== undefined) {
+      const value = replyLimitOverride === null ? null : Number(replyLimitOverride);
+      if (value !== null && (!Number.isInteger(value) || value < 0 || value > 10_000_000)) {
+        return res.status(400).json({ error: 'Reply limit must be a whole number between 0 and 10,000,000, or empty for the plan default.' });
+      }
+      if (value !== target.replyLimitOverride) {
+        data.replyLimitOverride = value;
+        actions.push({ action: 'limit', details: { from: target.replyLimitOverride, to: value } });
+      }
+    }
+
+    if (suspended !== undefined) {
+      if (typeof suspended !== 'boolean') return res.status(400).json({ error: 'suspended must be true or false' });
+      if (suspended && isSuperAdminEmail(target.email)) {
+        return res.status(400).json({ error: 'A super admin account cannot be suspended from here.' });
+      }
+      if (suspended !== target.suspended) {
+        const cleanReason = typeof reason === 'string' ? reason.trim().slice(0, 500) : '';
+        data.suspended = suspended;
+        data.suspendedReason = suspended ? (cleanReason || null) : null;
+        data.suspendedAt = suspended ? new Date() : null;
+        actions.push({ action: suspended ? 'suspend' : 'reactivate', details: suspended ? { reason: cleanReason || null } : null });
+      }
+    }
+
+    if (actions.length === 0) {
+      return res.json({ user: (await buildAdminClientRows([target]))[0], changed: false });
+    }
+
+    const updated = await prisma.$transaction(async (tx) => {
+      const u = await tx.user.update({ where: { id: target.id }, data, select: ADMIN_USER_SELECT });
+      await tx.adminAction.createMany({
+        data: actions.map(a => ({
+          adminEmail: req.adminEmail,
+          targetUserId: target.id,
+          targetEmail: target.email,
+          action: a.action,
+          details: a.details ?? undefined,
+        })),
+      });
+      return u;
+    });
+
+    // Make suspension / reactivation take effect immediately.
+    suspensionCache.delete(target.id);
+
+    console.log(`[admin] ${req.adminEmail} updated ${target.email}: ${actions.map(a => a.action).join(', ')}`);
+    res.json({ user: (await buildAdminClientRows([updated]))[0], changed: true });
+  } catch (err) {
+    console.error('[admin/users PATCH]', err.message);
+    res.status(500).json({ error: 'Failed to update client' });
+  }
+});
+
+// GET /api/admin/actions — recent admin activity (audit log)
+app.get('/api/admin/actions', requireSuperAdmin, async (req, res) => {
+  try {
+    const take = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 200);
+    const actions = await prisma.adminAction.findMany({ orderBy: { createdAt: 'desc' }, take });
+    res.set('Cache-Control', 'no-store');
+    res.json({ actions });
+  } catch (err) {
+    console.error('[admin/actions]', err.message);
+    res.status(500).json({ error: 'Failed to load admin activity' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
 // TICKET STATS — derived from DB Ticket table
 // ═══════════════════════════════════════════════════════════
 
@@ -1711,7 +2040,7 @@ const VALID_SENTIMENTS = ['Positive', 'Neutral', 'Frustrated']; // kept consiste
 // escalated ticket is not acceptable, confirmed by real user feedback.
 const ESCALATION_FALLBACK_MESSAGE = "Thanks for your question! I want to make sure I give you fully accurate information here, so I've flagged this for our team to confirm — they'll follow up with you shortly.";
 
-async function generateNativeDraft(userId, { customerName, messageText, customInstructions, channel, history = [], allowSideEffects = false }) {
+async function generateNativeDraftInner(userId, { customerName, messageText, customInstructions, channel, history = [], allowSideEffects = false }) {
   const user = await prisma.user.findUnique({
     where: { id: userId },
     select: {
@@ -2164,6 +2493,9 @@ app.post('/api/ai/draft', authenticateToken, async (req, res) => {
 
     res.json(responsePayload);
   } catch (error) {
+    if (error instanceof AiBlockedError) {
+      return res.status(error.reason === 'suspended' ? 403 : 402).json({ error: error.message, reason: error.reason });
+    }
     console.error('Draft Error:', error?.message || error);
     res.status(500).json({ error: 'Failed to generate draft' });
   }
