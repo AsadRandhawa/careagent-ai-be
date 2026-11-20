@@ -37,6 +37,18 @@ for (const key of ['META_APP_SECRET', 'PADDLE_WEBHOOK_SECRET', 'STRIPE_WEBHOOK_S
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const ACCESS_TOKEN_TTL = '30d'; // pragmatic default until refresh-token rotation ships — see audit notes
+const GRAPH_VERSION = process.env.GRAPH_VERSION || 'v25.0';
+
+// Short-lived in-memory session store for multi-Page selection (never client-stored)
+const pendingPageSelections = new Map();
+function prunePendingPageSelections() {
+  const now = Date.now();
+  for (const [key, value] of pendingPageSelections.entries()) {
+    if (now - value.createdAt > 10 * 60 * 1000) {
+      pendingPageSelections.delete(key);
+    }
+  }
+}
 
 const app = express();
 // Railway (like Heroku/Render/any platform behind a load balancer) puts this
@@ -767,33 +779,101 @@ app.get('/api/auth/google/callback', async (req, res) => {
 // FACEBOOK OAUTH (Connect Page)
 // ═══════════════════════════════════════════════════════════
 
+// Helper: establishes Page connection, sets webhooks, and records Instagram details
+async function connectFacebookPage(userId, page) {
+  const igBusinessId = page.instagram_business_account?.id || null;
+  const igUsername = page.instagram_business_account?.username || null;
+
+  // 1. Single subscription call after Instagram discovery
+  const subRes = await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/${page.id}/subscribed_apps`, {
+    method: 'POST',
+    body: new URLSearchParams({
+      subscribed_fields: 'messages,messaging_postbacks',
+      access_token: page.access_token,
+    }),
+  });
+  const subData = await subRes.json();
+  console.log('[Facebook] Page webhook subscribe result:', JSON.stringify(subData));
+  if (process.env.DEBUG_META === 'true') {
+    const subFields = Array.isArray(subData.data) ? subData.data.map(d => d.name || d).join(',') : (subData.success ? 'messages,messaging_postbacks' : 'none');
+    console.log(`[DEBUG_META][subscribed_apps] channel=facebook status=${subRes.status} success=${!!subData.success} fields=[${subFields}]`);
+  }
+  if (!subData.success) {
+    console.error('[Facebook] Page did NOT subscribe to webhooks — messages will not be delivered:', subData);
+  }
+
+  // 2. Best-effort ice breakers + persistent menu if Instagram linked
+  if (igBusinessId) {
+    try {
+      const profileRes = await fetch(
+        `https://graph.facebook.com/${GRAPH_VERSION}/${page.id}/messenger_profile?access_token=${page.access_token}&platform=instagram`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ice_breakers: [
+              { question: 'What programs do you offer?', payload: 'ICE_BREAKER_PROGRAMS' },
+              { question: 'What are the admission requirements?', payload: 'ICE_BREAKER_ADMISSIONS' },
+              { question: 'I need help with something else', payload: 'ICE_BREAKER_OTHER' },
+            ],
+            persistent_menu: [{
+              locale: 'default',
+              composer_input_disabled: false,
+              call_to_actions: [
+                { type: 'postback', title: 'Talk to a human', payload: 'MENU_HUMAN_HANDOFF' },
+                { type: 'postback', title: 'Start over', payload: 'MENU_RESTART' },
+              ],
+            }],
+          }),
+        }
+      );
+      const profileData = await profileRes.json().catch(() => ({}));
+      console.log('[Instagram] messenger_profile configuration result:', JSON.stringify(profileData));
+    } catch (profileErr) {
+      console.warn('[Instagram] messenger_profile configuration skipped:', profileErr.message);
+    }
+  }
+
+  // 3. Save to database
+  await prisma.user.update({
+    where: { id: userId },
+    data: {
+      facebookPageId: page.id,
+      facebookPageName: page.name,
+      facebookPageToken: page.access_token,
+      facebookConnected: true,
+      ...(igBusinessId ? {
+        instagramBusinessId: igBusinessId,
+        instagramUsername: igUsername,
+        instagramConnected: true,
+      } : {
+        instagramBusinessId: null,
+        instagramUsername: null,
+        instagramConnected: false,
+      }),
+    },
+  });
+
+  // Log (DEBUG_META): selected Page ID's last 4 characters and whether Instagram was present
+  if (process.env.DEBUG_META === 'true') {
+    const pageIdLast4 = page.id ? page.id.slice(-4) : 'unknown';
+    console.log(`[DEBUG_META][page_selected] page_id_last4=${pageIdLast4} ig_present=${!!igBusinessId}`);
+  }
+
+  return { success: true, pageName: page.name, igBusinessId, igUsername };
+}
+
 app.get('/api/auth/facebook', (req, res) => {
   const token = req.query.token;
   const params = new URLSearchParams({
     client_id: process.env.META_APP_ID,
     redirect_uri: process.env.FACEBOOK_REDIRECT_URI,
     state: token || '',
-    // Confirmed against this specific app's dashboard (Use cases → Messenger
-    // from Meta → Permissions and features): instagram_basic and
-    // instagram_manage_messages are the ones actually added to this app and
-    // showing "Ready for testing" — NOT instagram_business_basic /
-    // instagram_business_manage_messages. Those newer names are real, but
-    // they belong to a different integration path (standalone "Instagram
-    // Login") than the Page-linked Messenger flow this app uses. Confirmed
-    // by testing, not assumed — don't switch this back without re-checking
-    // the dashboard first.
-    // pages_read_engagement was removed here after App Review correctly
-    // rejected it: "your app's use case for the requested permission is
-    // invalid or is not needed to support its core functionality." That
-    // was accurate — nothing in this codebase ever reads Page posts,
-    // comments, or engagement data; CareAgent only needs to list Pages,
-    // send/receive DMs, and subscribe webhooks. Requesting a permission
-    // the app doesn't use isn't just a review-blocker, it's a real
-    // least-privilege violation worth fixing regardless of App Review.
     scope: 'pages_show_list,pages_messaging,pages_manage_metadata,business_management,instagram_basic,instagram_manage_messages',
     response_type: 'code',
+    auth_type: 'rerequest',
   });
-  res.redirect(`https://www.facebook.com/v19.0/dialog/oauth?${params}`);
+  res.redirect(`https://www.facebook.com/${GRAPH_VERSION}/dialog/oauth?${params}`);
 });
 
 app.get('/api/auth/facebook/callback', async (req, res) => {
@@ -801,10 +881,12 @@ app.get('/api/auth/facebook/callback', async (req, res) => {
   const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
   try {
     if (!code) throw new Error('No code returned from Facebook');
+    if (!state) throw new Error('Missing state parameter');
+    const decoded = jwt.verify(state, JWT_SECRET);
 
     // 1. Exchange code for a short-lived user token
     const tokenRes = await fetch(
-      `https://graph.facebook.com/v19.0/oauth/access_token?` +
+      `https://graph.facebook.com/${GRAPH_VERSION}/oauth/access_token?` +
       new URLSearchParams({
         client_id: process.env.META_APP_ID,
         client_secret: process.env.META_APP_SECRET,
@@ -817,7 +899,7 @@ app.get('/api/auth/facebook/callback', async (req, res) => {
 
     // 2. Exchange for a long-lived user token (~60 days)
     const longLivedRes = await fetch(
-      `https://graph.facebook.com/v19.0/oauth/access_token?` +
+      `https://graph.facebook.com/${GRAPH_VERSION}/oauth/access_token?` +
       new URLSearchParams({
         grant_type: 'fb_exchange_token',
         client_id: process.env.META_APP_ID,
@@ -828,12 +910,10 @@ app.get('/api/auth/facebook/callback', async (req, res) => {
     const longLivedData = await longLivedRes.json();
     const longLivedToken = longLivedData.access_token || tokenData.access_token;
 
-    // 2b. Verify the connecting account is tied to a real Business Manager account.
-    // This is a genuine business_management-scoped call — best-effort only, never
-    // blocks the connect flow if it fails (e.g. user has no Business Manager yet).
+    // 2b. Verify business_management (best-effort)
     try {
       const bizRes = await fetch(
-        `https://graph.facebook.com/v19.0/me/businesses?access_token=${longLivedToken}`
+        `https://graph.facebook.com/${GRAPH_VERSION}/me/businesses?access_token=${longLivedToken}`
       );
       const bizData = await bizRes.json();
       console.log('[Facebook] business_management verification:', JSON.stringify(bizData));
@@ -841,121 +921,98 @@ app.get('/api/auth/facebook/callback', async (req, res) => {
       console.warn('[Facebook] business_management verification skipped:', bizErr.message);
     }
 
-    // 3. Get the Pages this user manages
+    // 3. Single call: get all Pages managed by user with linked Instagram accounts
     const pagesRes = await fetch(
-      `https://graph.facebook.com/v19.0/me/accounts?access_token=${longLivedToken}`
+      `https://graph.facebook.com/${GRAPH_VERSION}/me/accounts?fields=id,name,access_token,instagram_business_account{id,username}&limit=100&access_token=${longLivedToken}`
     );
     const pagesData = await pagesRes.json();
-    const page = pagesData.data?.[0]; // first Page — extend to a picker later if user has multiple
-    if (!page) throw new Error('No Facebook Page found for this account');
+    const pages = pagesData.data || [];
 
-    // 4. Subscribe the app to this Page's webhooks (covers Messenger)
-    const subRes = await fetch(`https://graph.facebook.com/v19.0/${page.id}/subscribed_apps`, {
-      method: 'POST',
-      body: new URLSearchParams({
-        subscribed_fields: 'messages,messaging_postbacks',
-        access_token: page.access_token,
-      }),
-    });
-    const subData = await subRes.json();
-    console.log('[Facebook] Page webhook subscribe result:', JSON.stringify(subData));
-    if (!subData.success) {
-      console.error('[Facebook] Page did NOT subscribe to webhooks — messages will not be delivered:', subData);
-    }
-
-    // 4b. Discover a linked Instagram professional account on this Page, if any.
-    // Instagram DMs are delivered through the same Page-linked infrastructure —
-    // no separate OAuth step needed, just a separate object to look up and subscribe.
-    let igBusinessId = null;
-    let igUsername = null;
-    try {
-      const igLookupRes = await fetch(
-        `https://graph.facebook.com/v19.0/${page.id}?fields=instagram_business_account{id,username}&access_token=${page.access_token}`
-      );
-      const igLookupData = await igLookupRes.json();
-      if (igLookupData?.instagram_business_account?.id) {
-        igBusinessId = igLookupData.instagram_business_account.id;
-        igUsername = igLookupData.instagram_business_account.username || null;
-
-        // Subscribe the Page to Instagram messaging webhooks too — same call,
-        // Meta routes "messages" events to whichever webhook config (Page vs
-        // Instagram object) is registered in the dashboard for this app.
-        const igSubRes = await fetch(`https://graph.facebook.com/v19.0/${page.id}/subscribed_apps`, {
-          method: 'POST',
-          body: new URLSearchParams({
-            subscribed_fields: 'messages',
-            access_token: page.access_token,
-          }),
-        });
-        const igSubData = await igSubRes.json();
-        console.log('[Instagram] Webhook subscribe result:', JSON.stringify(igSubData));
-      } else {
-        console.log('[Instagram] No linked Instagram professional account on this Page — skipping.');
-      }
-    } catch (igErr) {
-      console.warn('[Instagram] Discovery/subscription skipped:', igErr.message);
-    }
-
-    // 4c. Configure ice breakers + persistent menu for the connected
-    // Instagram account. Required by Meta's Instagram review for the
-    // "no custom inbox solution" (autonomous) track — CareAgent's WhatsApp
-    // auto-reply had no equivalent requirement, this is Instagram-specific.
-    // Best-effort: a business can still use CareAgent (human-reviewed
-    // mode) even if this fails, so this never blocks the connect flow.
-    if (igBusinessId) {
+    if (process.env.DEBUG_META === 'true') {
+      let grantedScopes = 'unknown';
       try {
-        const profileRes = await fetch(
-          `https://graph.facebook.com/v19.0/${page.id}/messenger_profile?access_token=${page.access_token}&platform=instagram`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              ice_breakers: [
-                { question: 'What programs do you offer?', payload: 'ICE_BREAKER_PROGRAMS' },
-                { question: 'What are the admission requirements?', payload: 'ICE_BREAKER_ADMISSIONS' },
-                { question: 'I need help with something else', payload: 'ICE_BREAKER_OTHER' },
-              ],
-              persistent_menu: [{
-                locale: 'default',
-                composer_input_disabled: false,
-                call_to_actions: [
-                  { type: 'postback', title: 'Talk to a human', payload: 'MENU_HUMAN_HANDOFF' },
-                  { type: 'postback', title: 'Start over', payload: 'MENU_RESTART' },
-                ],
-              }],
-            }),
-          }
-        );
-        const profileData = await profileRes.json().catch(() => ({}));
-        console.log('[Instagram] messenger_profile configuration result:', JSON.stringify(profileData));
-      } catch (profileErr) {
-        console.warn('[Instagram] messenger_profile configuration skipped:', profileErr.message);
-      }
+        const dbgRes = await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/debug_token?input_token=${longLivedToken}&access_token=${process.env.META_APP_ID}|${process.env.META_APP_SECRET}`);
+        const dbgData = await dbgRes.json();
+        grantedScopes = (dbgData?.data?.scopes || []).join(',');
+      } catch (_) {}
+      const pageIgList = pages.map(p => `page_${p.id}:ig_present=${!!p.instagram_business_account?.id}`).join(' ');
+      console.log(`[DEBUG_META][oauth_callback] granted_scopes=[${grantedScopes}] pages_count=${pages.length} pages=[${pageIgList}]`);
     }
 
-    // 5. Save to DB
-    if (state) {
-      const decoded = jwt.verify(state, JWT_SECRET);
-      await prisma.user.update({
-        where: { id: decoded.userId },
-        data: {
-          facebookPageId: page.id,
-          facebookPageName: page.name,
-          facebookPageToken: page.access_token,
-          facebookConnected: true,
-          ...(igBusinessId ? {
-            instagramBusinessId: igBusinessId,
-            instagramUsername: igUsername,
-            instagramConnected: true,
-          } : {}),
-        },
-      });
+    // 0 Pages: clear error asking the user to grant a Page
+    if (pages.length === 0) {
+      return res.redirect(`${frontendUrl}/channels?error=no_pages`);
     }
 
-    res.redirect(`${frontendUrl}/channels?connected=facebook`);
+    // Exactly 1 Page: use it immediately as today
+    if (pages.length === 1) {
+      await connectFacebookPage(decoded.userId, pages[0]);
+      return res.redirect(`${frontendUrl}/channels?connected=facebook`);
+    }
+
+    // More than 1: keep in short-lived server session (never in URL or client storage) and show picker
+    prunePendingPageSelections();
+    const sessionId = crypto.randomUUID();
+    pendingPageSelections.set(sessionId, {
+      userId: decoded.userId,
+      createdAt: Date.now(),
+      pages: pages.map(p => ({
+        id: p.id,
+        name: p.name,
+        access_token: p.access_token,
+        instagram_business_account: p.instagram_business_account || null,
+      })),
+    });
+
+    res.redirect(`${frontendUrl}/channels?select_page=true&session=${sessionId}`);
   } catch (error) {
     console.error('Facebook Auth Error:', error.message || error);
     res.redirect(`${frontendUrl}/channels?error=auth_failed`);
+  }
+});
+
+// Endpoint for frontend to fetch available Pages for multi-Page selection session
+app.get('/api/auth/facebook/pending-pages', authenticateToken, async (req, res) => {
+  const session = req.query.session;
+  if (!session) return res.status(400).json({ error: 'Session query parameter required' });
+  prunePendingPageSelections();
+  const sessionData = pendingPageSelections.get(session);
+  if (!sessionData || sessionData.userId !== req.user.userId) {
+    return res.status(404).json({ error: 'Page selection session expired or not found. Please try connecting again.' });
+  }
+  res.json({
+    pages: sessionData.pages.map(p => ({
+      id: p.id,
+      name: p.name,
+      hasInstagram: !!p.instagram_business_account?.id,
+      instagramUsername: p.instagram_business_account?.username || null,
+    })),
+  });
+});
+
+// Endpoint for user to pick and connect a specific Facebook Page
+app.post('/api/auth/facebook/select-page', authenticateToken, async (req, res) => {
+  const { session, pageId } = req.body;
+  if (!session || !pageId) {
+    return res.status(400).json({ error: 'Session ID and page ID are required.' });
+  }
+  prunePendingPageSelections();
+  const sessionData = pendingPageSelections.get(session);
+  if (!sessionData || sessionData.userId !== req.user.userId) {
+    return res.status(400).json({ error: 'Page selection session expired. Please connect again.' });
+  }
+  const page = sessionData.pages.find(p => p.id === pageId);
+  if (!page) {
+    return res.status(400).json({ error: 'Selected Page was not found in this session.' });
+  }
+
+  try {
+    const result = await connectFacebookPage(req.user.userId, page);
+    pendingPageSelections.delete(session);
+    res.json(result);
+  } catch (err) {
+    console.error('[Facebook select-page error]:', err.message);
+    res.status(500).json({ error: 'Failed to connect selected Page.' });
   }
 });
 
@@ -2799,9 +2856,15 @@ app.get('/api/facebook/webhook', (req, res) => {
 app.post('/api/facebook/webhook', async (req, res) => {
   res.sendStatus(200); // ack immediately — Meta retries aggressively on non-200
 
+  const sigValid = isValidMetaSignature(req);
+  if (process.env.DEBUG_META === 'true') {
+    const entryIds = (req.body?.entry || []).map(e => e.id).join(',');
+    console.log(`[DEBUG_META][webhook_post] channel=facebook object=${req.body?.object || 'unknown'} entry_count=${req.body?.entry?.length || 0} entry_ids=[${entryIds}] sig_valid=${sigValid}`);
+  }
+
   try {
-    if (!isValidMetaSignature(req)) {
-      console.warn('[Facebook] Dropping unverified webhook payload.');
+    if (!sigValid) {
+      console.warn('[Meta Webhook Dropped] channel=facebook reason=invalid_signature');
       return; // response already sent (200) to satisfy Meta's retry policy; event is discarded, not processed
     }
     console.log('[Facebook] Webhook payload received:', JSON.stringify(req.body));
@@ -2809,18 +2872,28 @@ app.post('/api/facebook/webhook', async (req, res) => {
     for (const entry of req.body.entry || []) {
       const pageId = entry.id;
       for (const event of entry.messaging || []) {
-        if (!event.message || event.message.is_echo) continue; // skip our own sent messages
+        if (!event.message || event.message.is_echo) {
+          console.log(`[Meta Webhook Dropped] channel=facebook reason=${!event.message ? 'non_message_event' : 'echo_message'} entry_id=${pageId}`);
+          continue; // skip our own sent messages
+        }
 
         const senderId = event.sender.id;
         const text = event.message.text || '[Attachment received]';
 
         const user = await prisma.user.findFirst({ where: { facebookPageId: pageId } });
-        if (!user) continue;
+        if (!user) {
+          console.warn(`[Meta Webhook Dropped] channel=facebook reason=client_lookup_miss entry_id=${pageId}`);
+          continue;
+        }
+
+        if (process.env.DEBUG_META === 'true') {
+          console.log(`[DEBUG_META][webhook_event] channel=facebook lookup=hit entry_id=${pageId} ticket=created`);
+        }
 
         let customerName = senderId;
         try {
           const profileRes = await fetch(
-            `https://graph.facebook.com/v19.0/${senderId}?fields=name&access_token=${user.facebookPageToken}`
+            `https://graph.facebook.com/${GRAPH_VERSION}/${senderId}?fields=name&access_token=${user.facebookPageToken}`
           );
           const profile = await profileRes.json();
           if (profile.name) customerName = profile.name;
@@ -2884,7 +2957,7 @@ app.post('/api/facebook/reply', authenticateToken, requireIdempotencyKey, async 
     if (!user?.facebookPageToken) return res.status(400).json({ error: 'Facebook not connected' });
 
     const sendRes = await fetch(
-      `https://graph.facebook.com/v19.0/me/messages?access_token=${user.facebookPageToken}`,
+      `https://graph.facebook.com/${GRAPH_VERSION}/me/messages?access_token=${user.facebookPageToken}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2894,6 +2967,9 @@ app.post('/api/facebook/reply', authenticateToken, requireIdempotencyKey, async 
         }),
       }
     );
+    if (process.env.DEBUG_META === 'true') {
+      console.log(`[DEBUG_META][outbound_send] channel=facebook status=${sendRes.status}`);
+    }
     if (!sendRes.ok) {
       const err = await sendRes.json().catch(() => null);
       const metaError = err?.error;
@@ -2953,9 +3029,15 @@ app.get('/api/instagram/webhook', (req, res) => {
 app.post('/api/instagram/webhook', async (req, res) => {
   res.sendStatus(200); // ack immediately
 
+  const sigValid = isValidMetaSignature(req);
+  if (process.env.DEBUG_META === 'true') {
+    const entryIds = (req.body?.entry || []).map(e => e.id).join(',');
+    console.log(`[DEBUG_META][webhook_post] channel=instagram object=${req.body?.object || 'unknown'} entry_count=${req.body?.entry?.length || 0} entry_ids=[${entryIds}] sig_valid=${sigValid}`);
+  }
+
   try {
-    if (!isValidMetaSignature(req)) {
-      console.warn('[Instagram] Dropping unverified webhook payload.');
+    if (!sigValid) {
+      console.warn('[Meta Webhook Dropped] channel=instagram reason=invalid_signature');
       return;
     }
     console.log('[Instagram] Webhook payload received:', JSON.stringify(req.body));
@@ -2963,18 +3045,28 @@ app.post('/api/instagram/webhook', async (req, res) => {
     for (const entry of req.body.entry || []) {
       const igBusinessId = entry.id;
       for (const event of entry.messaging || []) {
-        if (!event.message || event.message.is_echo) continue;
+        if (!event.message || event.message.is_echo) {
+          console.log(`[Meta Webhook Dropped] channel=instagram reason=${!event.message ? 'non_message_event' : 'echo_message'} entry_id=${igBusinessId}`);
+          continue;
+        }
 
         const senderId = event.sender.id;
         const text = event.message.text || '[Attachment received]';
 
         const user = await prisma.user.findFirst({ where: { instagramBusinessId: igBusinessId } });
-        if (!user) continue;
+        if (!user) {
+          console.warn(`[Meta Webhook Dropped] channel=instagram reason=client_lookup_miss entry_id=${igBusinessId}`);
+          continue;
+        }
+
+        if (process.env.DEBUG_META === 'true') {
+          console.log(`[DEBUG_META][webhook_event] channel=instagram lookup=hit entry_id=${igBusinessId} ticket=created`);
+        }
 
         let customerName = senderId;
         try {
           const profileRes = await fetch(
-            `https://graph.facebook.com/v19.0/${senderId}?fields=name&access_token=${user.facebookPageToken}`
+            `https://graph.facebook.com/${GRAPH_VERSION}/${senderId}?fields=name&access_token=${user.facebookPageToken}`
           );
           const profile = await profileRes.json();
           if (profile.name) customerName = profile.name;
@@ -3047,7 +3139,7 @@ app.post('/api/instagram/reply', authenticateToken, requireIdempotencyKey, async
     // token in this flow, so instagramAccessToken is never populated; the
     // Page token is the correct, and only, credential for sending here.
     const sendRes = await fetch(
-      `https://graph.facebook.com/v19.0/me/messages?access_token=${user.facebookPageToken}`,
+      `https://graph.facebook.com/${GRAPH_VERSION}/me/messages?access_token=${user.facebookPageToken}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3057,6 +3149,9 @@ app.post('/api/instagram/reply', authenticateToken, requireIdempotencyKey, async
         }),
       }
     );
+    if (process.env.DEBUG_META === 'true') {
+      console.log(`[DEBUG_META][outbound_send] channel=instagram status=${sendRes.status}`);
+    }
     if (!sendRes.ok) {
       const err = await sendRes.json().catch(() => null);
       const metaError = err?.error;
@@ -3277,7 +3372,7 @@ async function sendWhatsAppMessage(user, ticket, text, senderName = 'Agent') {
   }
 
   const waRes = await fetch(
-    `https://graph.facebook.com/v19.0/${phoneNumberId}/messages`,
+    `https://graph.facebook.com/${GRAPH_VERSION}/${phoneNumberId}/messages`,
     {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
@@ -3541,7 +3636,7 @@ async function tryAutoReplyInstagramNative(user, ticket, currentMessageText) {
       const ackMessage = result.codeForcedEscalation ? ESCALATION_FALLBACK_MESSAGE : result.draft;
       try {
         const ackRes = await fetch(
-          `https://graph.facebook.com/v19.0/me/messages?access_token=${user.facebookPageToken}`,
+          `https://graph.facebook.com/${GRAPH_VERSION}/me/messages?access_token=${user.facebookPageToken}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -3568,7 +3663,7 @@ async function tryAutoReplyInstagramNative(user, ticket, currentMessageText) {
     // Uses graph.facebook.com + facebookPageToken — see comment in
     // /api/instagram/reply above for the full explanation.
     const sendRes = await fetch(
-      `https://graph.facebook.com/v19.0/me/messages?access_token=${user.facebookPageToken}`,
+      `https://graph.facebook.com/${GRAPH_VERSION}/me/messages?access_token=${user.facebookPageToken}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3584,6 +3679,9 @@ async function tryAutoReplyInstagramNative(user, ticket, currentMessageText) {
         }),
       }
     );
+    if (process.env.DEBUG_META === 'true') {
+      console.log(`[DEBUG_META][outbound_send] channel=instagram_autoreply status=${sendRes.status}`);
+    }
     if (!sendRes.ok) {
       const errBody = await sendRes.json().catch(() => null);
       const metaError = errBody?.error;
@@ -3647,7 +3745,7 @@ async function tryAutoReplyFacebookNative(user, ticket, currentMessageText) {
     });
 
     const sendToMessenger = async (text) => {
-      return fetch(`https://graph.facebook.com/v19.0/me/messages?access_token=${user.facebookPageToken}`, {
+      return fetch(`https://graph.facebook.com/${GRAPH_VERSION}/me/messages?access_token=${user.facebookPageToken}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -3679,6 +3777,9 @@ async function tryAutoReplyFacebookNative(user, ticket, currentMessageText) {
     }
 
     const sendRes = await sendToMessenger(result.draft);
+    if (process.env.DEBUG_META === 'true') {
+      console.log(`[DEBUG_META][outbound_send] channel=facebook_autoreply status=${sendRes.status}`);
+    }
     if (!sendRes.ok) {
       const errBody = await sendRes.json().catch(() => null);
       const metaError = errBody?.error;
@@ -3960,7 +4061,7 @@ app.post('/api/whatsapp/connect', authenticateToken, async (req, res) => {
 
     // Step 1: exchange the authorization code for a short-lived token.
     const shortLivedRes = await fetch(
-      `https://graph.facebook.com/v19.0/oauth/access_token?client_id=${process.env.META_APP_ID}&client_secret=${process.env.META_APP_SECRET}&code=${encodeURIComponent(code)}`
+      `https://graph.facebook.com/${GRAPH_VERSION}/oauth/access_token?client_id=${process.env.META_APP_ID}&client_secret=${process.env.META_APP_SECRET}&code=${encodeURIComponent(code)}`
     );
     const shortLivedData = await shortLivedRes.json();
     if (!shortLivedRes.ok || !shortLivedData.access_token) {
@@ -3973,7 +4074,7 @@ app.post('/api/whatsapp/connect', authenticateToken, async (req, res) => {
     // which would have made every connection silently stop working a
     // couple hours after setup.
     const longLivedRes = await fetch(
-      `https://graph.facebook.com/v19.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${process.env.META_APP_ID}&client_secret=${process.env.META_APP_SECRET}&fb_exchange_token=${shortLivedData.access_token}`
+      `https://graph.facebook.com/${GRAPH_VERSION}/oauth/access_token?grant_type=fb_exchange_token&client_id=${process.env.META_APP_ID}&client_secret=${process.env.META_APP_SECRET}&fb_exchange_token=${shortLivedData.access_token}`
     );
     const longLivedData = await longLivedRes.json();
     if (!longLivedRes.ok || !longLivedData.access_token) {
@@ -4012,7 +4113,7 @@ app.post('/api/whatsapp/connect', authenticateToken, async (req, res) => {
       try {
         const appToken = `${process.env.META_APP_ID}|${process.env.META_APP_SECRET}`;
         const debugRes = await fetch(
-          `https://graph.facebook.com/v19.0/debug_token?input_token=${longLivedData.access_token}&access_token=${appToken}`
+          `https://graph.facebook.com/${GRAPH_VERSION}/debug_token?input_token=${longLivedData.access_token}&access_token=${appToken}`
         );
         const debugData = await debugRes.json();
         console.log('[WhatsApp] Discovery — debug_token result:', JSON.stringify(debugData));
@@ -4025,7 +4126,7 @@ app.post('/api/whatsapp/connect', authenticateToken, async (req, res) => {
 
         if (discoveredWabaId) {
           const numbersRes = await fetch(
-            `https://graph.facebook.com/v19.0/${discoveredWabaId}/phone_numbers?access_token=${longLivedData.access_token}`
+            `https://graph.facebook.com/${GRAPH_VERSION}/${discoveredWabaId}/phone_numbers?access_token=${longLivedData.access_token}`
           );
           const numbersData = await numbersRes.json();
           console.log(`[WhatsApp] Discovery — phone numbers on WABA ${discoveredWabaId}:`, JSON.stringify(numbersData));
@@ -4054,7 +4155,7 @@ app.post('/api/whatsapp/connect', authenticateToken, async (req, res) => {
     // Meta has no reason to ever call your webhook for this number's
     // messages, even with everything else configured correctly.
     const subscribeRes = await fetch(
-      `https://graph.facebook.com/v19.0/${wabaId}/subscribed_apps`,
+      `https://graph.facebook.com/${GRAPH_VERSION}/${wabaId}/subscribed_apps`,
       { method: 'POST', headers: { 'Authorization': `Bearer ${longLivedData.access_token}` } }
     );
     if (!subscribeRes.ok) {

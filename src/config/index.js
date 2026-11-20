@@ -22,6 +22,6 @@ export const config = {
     // Meta / WhatsApp Business API
     appSecret:   process.env.WHATSAPP_APP_SECRET,
     verifyToken: process.env.WHATSAPP_VERIFY_TOKEN || 'careagent_verify_token',
-    apiVersion:  'v19.0',
+    apiVersion:  process.env.GRAPH_VERSION || 'v25.0',
   },
 };
