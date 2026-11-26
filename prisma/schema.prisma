@@ -103,6 +103,18 @@ model User {
   tickets               Ticket[]
   leads                 Lead[]
   complaints            Complaint[]
+  autoReplyChanges      AutoReplyChange[]
+}
+
+model AutoReplyChange {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel   String
+  enabled   Boolean
+  createdAt DateTime @default(now())
+
+  @@index([userId])
 }
 
 model DocumentChunk {

@@ -682,28 +682,104 @@ app.patch('/api/user/ai-instructions', authenticateToken, async (req, res) => {
   }
 });
 
-// Update user preferences (gmailEnabled, lastSeenInboxAt, lastSeenEscalAt)
+// Update user preferences (gmailEnabled, lastSeenInboxAt, lastSeenEscalAt, autoSend flags)
 app.patch('/api/user/preferences', authenticateToken, async (req, res) => {
   try {
     const { gmailEnabled, lastSeenInboxAt, lastSeenEscalAt,
             aiAutoDrafting, autoClassification, sentimentTracking, facebookEnabled, instagramEnabled,
             instagramAutoSend, livechatAutoSend, whatsappAutoSend, facebookAutoSend } = req.body;
+
+    const autoSendKeys = [
+      { key: 'whatsappAutoSend', channel: 'WhatsApp' },
+      { key: 'facebookAutoSend', channel: 'Facebook Messenger' },
+      { key: 'instagramAutoSend', channel: 'Instagram DMs' },
+      { key: 'livechatAutoSend', channel: 'Web Live Chat' },
+    ];
+
+    // 1. Strict boolean validation
+    for (const { key } of autoSendKeys) {
+      if (req.body[key] !== undefined && typeof req.body[key] !== 'boolean') {
+        return res.status(400).json({ error: `${key} must be a strict boolean.` });
+      }
+    }
+
+    // 2. Reject enabling auto-reply if channel is not connected (HTTP 409)
+    const wantsToEnableAny = autoSendKeys.some(({ key }) => req.body[key] === true);
+    if (wantsToEnableAny) {
+      const current = await prisma.user.findUnique({
+        where: { id: req.user.userId },
+        select: {
+          whatsappPhoneNumberId: true,
+          whatsappToken: true,
+          facebookConnected: true,
+          facebookPageToken: true,
+          instagramConnected: true,
+          livechatToken: true,
+        },
+      });
+
+      if (!current) return res.status(404).json({ error: 'User not found' });
+
+      const isWaConnected = !!(
+        (current.whatsappToken && current.whatsappPhoneNumberId) ||
+        (process.env.WHATSAPP_ACCESS_TOKEN &&
+         process.env.WHATSAPP_PHONE_NUMBER_ID &&
+         process.env.WHATSAPP_OWNER_USER_ID === req.user.userId)
+      );
+      const isFbConnected = !!(current.facebookConnected && current.facebookPageToken);
+      const isIgConnected = !!(current.instagramConnected && current.facebookPageToken);
+      const isLcConnected = !!current.livechatToken;
+
+      if (whatsappAutoSend === true && !isWaConnected) {
+        return res.status(409).json({ error: 'Cannot enable auto-reply: WhatsApp is not connected.' });
+      }
+      if (facebookAutoSend === true && !isFbConnected) {
+        return res.status(409).json({ error: 'Cannot enable auto-reply: Facebook Messenger is not connected.' });
+      }
+      if (instagramAutoSend === true && !isIgConnected) {
+        return res.status(409).json({ error: 'Cannot enable auto-reply: Instagram DMs is not connected.' });
+      }
+      if (livechatAutoSend === true && !isLcConnected) {
+        return res.status(409).json({ error: 'Cannot enable auto-reply: Web Live Chat is not connected.' });
+      }
+    }
+
     const data = {};
     if (gmailEnabled          !== undefined) data.gmailEnabled          = gmailEnabled;
     if (facebookEnabled       !== undefined) data.facebookEnabled       = facebookEnabled;
     if (instagramEnabled      !== undefined) data.instagramEnabled      = instagramEnabled;
-    if (instagramAutoSend     !== undefined) data.instagramAutoSend     = instagramAutoSend;
-    if (livechatAutoSend      !== undefined) data.livechatAutoSend      = livechatAutoSend;
-    if (whatsappAutoSend      !== undefined) data.whatsappAutoSend      = whatsappAutoSend;
-    if (facebookAutoSend      !== undefined) data.facebookAutoSend      = facebookAutoSend;
     if (aiAutoDrafting        !== undefined) data.aiAutoDrafting        = aiAutoDrafting;
     if (autoClassification    !== undefined) data.autoClassification    = autoClassification;
     if (sentimentTracking     !== undefined) data.sentimentTracking     = sentimentTracking;
     if (lastSeenInboxAt       !== undefined) data.lastSeenInboxAt       = new Date(lastSeenInboxAt);
     if (lastSeenEscalAt       !== undefined) data.lastSeenEscalAt       = new Date(lastSeenEscalAt);
+
+    // 3. Log each auto-send change server-side
+    for (const { key, channel } of autoSendKeys) {
+      if (req.body[key] !== undefined) {
+        data[key] = req.body[key];
+        console.log(`[AutoReply Config] tenant_id=${req.user.userId} channel=${channel} auto_send=${req.body[key]} timestamp=${new Date().toISOString()}`);
+      }
+    }
+
     await prisma.user.update({ where: { id: req.user.userId }, data });
+
+    // Persist to AutoReplyChange audit table
+    for (const { key } of autoSendKeys) {
+      if (req.body[key] !== undefined) {
+        await prisma.autoReplyChange.create({
+          data: {
+            userId: req.user.userId,
+            channel: key,
+            enabled: req.body[key],
+          },
+        }).catch(e => console.error('[AutoReplyChange] Failed to record preference change:', e.message));
+      }
+    }
+
     res.json({ success: true });
   } catch (err) {
+    console.error('[preferences PATCH error]', err.message);
     res.status(500).json({ error: 'Failed to update preferences' });
   }
 });
@@ -726,11 +802,49 @@ app.delete('/api/user/disconnect/facebook', authenticateToken, async (req, res) 
   try {
     await prisma.user.update({
       where: { id: req.user.userId },
-      data: { facebookPageId: null, facebookPageName: null, facebookPageToken: null, facebookConnected: false, facebookEnabled: true }
+      data: {
+        facebookPageId: null,
+        facebookPageName: null,
+        facebookPageToken: null,
+        facebookConnected: false,
+        facebookEnabled: true,
+        facebookAutoSend: false,
+        instagramAutoSend: false,
+      }
     });
+    await prisma.autoReplyChange.createMany({
+      data: [
+        { userId: req.user.userId, channel: 'facebookAutoSend', enabled: false },
+        { userId: req.user.userId, channel: 'instagramAutoSend', enabled: false },
+      ],
+    }).catch(e => console.error('[AutoReplyChange] Failed to record FB disconnect reset:', e.message));
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to disconnect Facebook.' });
+  }
+});
+
+// Disconnect Live Chat
+app.delete('/api/user/disconnect/livechat', authenticateToken, async (req, res) => {
+  try {
+    await prisma.user.update({
+      where: { id: req.user.userId },
+      data: {
+        livechatToken: null,
+        livechatEnabled: false,
+        livechatAutoSend: false,
+      }
+    });
+    await prisma.autoReplyChange.create({
+      data: {
+        userId: req.user.userId,
+        channel: 'livechatAutoSend',
+        enabled: false,
+      },
+    }).catch(e => console.error('[AutoReplyChange] Failed to record LiveChat disconnect reset:', e.message));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to disconnect Live Chat.' });
   }
 });
 
@@ -1087,9 +1201,13 @@ app.post('/api/tickets/dismiss', authenticateToken, async (req, res) => {
     // so the ticket reappeared on the next refresh. Matching on `id` now,
     // consistent with every other id-based lookup in this file (e.g.
     // GET /api/tickets/:id/messages above).
+    const updateData = { status, escalationReason: null };
+    if (status === 'resolved') {
+      updateData.resolvedAt = new Date();
+    }
     const ticketResult = await prisma.ticket.updateMany({
       where: { userId: req.user.userId, id: ticketId },
-      data: { status, escalationReason: null }
+      data: updateData
     });
 
     // Website Live Chat escalations live on ChatSession, not Ticket — a
@@ -1681,7 +1799,7 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
     // every ticket actually resolved in this period. Previously this was
     // hardcoded to the literal string 'N/A' and never computed at all.
     let avgResolutionTime = '—';
-    if (resolvedForAvgTime.length >= MIN_SAMPLE) {
+    if (resolvedForAvgTime.length > 0) {
       const totalMs = resolvedForAvgTime.reduce((sum, t) => {
         const ms = new Date(t.resolvedAt) - new Date(t.receivedAt);
         return sum + (Number.isFinite(ms) && ms > 0 ? ms : 0);
@@ -1751,6 +1869,198 @@ app.get('/api/tickets/stats', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('Stats error:', err);
     res.status(500).json({ error: 'Failed to fetch stats.' });
+  }
+});
+
+// GET — detailed modal data for dashboard metrics: open, resolution, escalation
+// Reuses the exact same query logic and predicates as /api/tickets/stats so modal count === card count.
+app.get('/api/tickets/stats/details', authenticateToken, async (req, res) => {
+  try {
+    const { metric } = req.query;
+    const days = parseInt(req.query.days || '30');
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const userId = req.user.userId;
+
+    if (!['open', 'resolution', 'escalation'].includes(metric)) {
+      return res.status(400).json({ error: 'metric query param must be one of: open, resolution, escalation' });
+    }
+
+    if (metric === 'open') {
+      const [nonGmailOpenCount, activeLivechatSessions, ticketRows] = await Promise.all([
+        prisma.ticket.count({ where: { userId, channel: { not: 'gmail' }, status: 'new' } }),
+        prisma.chatSession.findMany({
+          where: { userId, status: 'active' },
+          select: {
+            id: true,
+            visitorName: true,
+            createdAt: true,
+            updatedAt: true,
+            escalated: true,
+            messages: { orderBy: { createdAt: 'desc' }, take: 1, select: { role: true, createdAt: true } },
+          },
+        }),
+        prisma.ticket.findMany({
+          where: { userId, channel: { not: 'gmail' }, status: 'new' },
+          orderBy: { receivedAt: 'asc' },
+          take: 50,
+          select: {
+            id: true,
+            customerName: true,
+            channel: true,
+            status: true,
+            urgency: true,
+            receivedAt: true,
+            subject: true,
+          },
+        }),
+      ]);
+
+      const waitingLivechatSessions = activeLivechatSessions.filter(
+        s => !s.escalated && s.messages[0]?.role === 'visitor'
+      );
+      const totalCount = nonGmailOpenCount + waitingLivechatSessions.length;
+
+      const livechatRows = waitingLivechatSessions.map(s => ({
+        id: s.id,
+        customerName: s.visitorName || 'Website Visitor',
+        channel: 'livechat',
+        status: 'new',
+        urgency: 'medium',
+        receivedAt: s.messages[0]?.createdAt || s.updatedAt,
+        isLivechat: true,
+      }));
+
+      const combined = [...ticketRows, ...livechatRows]
+        .sort((a, b) => new Date(a.receivedAt).getTime() - new Date(b.receivedAt).getTime())
+        .slice(0, 50);
+
+      return res.json({
+        metric: 'open',
+        count: totalCount,
+        items: combined,
+      });
+    }
+
+    if (metric === 'resolution') {
+      const resolvedForAvgTime = await prisma.ticket.findMany({
+        where: { userId, status: 'resolved', resolvedAt: { gte: since, not: null } },
+        select: {
+          id: true,
+          customerName: true,
+          channel: true,
+          status: true,
+          urgency: true,
+          receivedAt: true,
+          resolvedAt: true,
+        },
+      });
+
+      const MIN_SAMPLE = 5;
+      let totalMs = 0;
+      const channelData = {};
+      const withDurations = resolvedForAvgTime.map(t => {
+        const ms = Math.max(0, new Date(t.resolvedAt) - new Date(t.receivedAt));
+        totalMs += ms;
+        const ch = t.channel || 'unknown';
+        if (!channelData[ch]) {
+          channelData[ch] = { channel: ch, count: 0, totalMs: 0 };
+        }
+        channelData[ch].count += 1;
+        channelData[ch].totalMs += ms;
+        return { ...t, durationMs: ms };
+      });
+
+      const formatDuration = (ms) => {
+        if (!Number.isFinite(ms) || ms <= 0) return '0 sec';
+        const mins = ms / (1000 * 60);
+        if (mins < 1) return `${Math.max(1, Math.round(ms / 1000))} sec`;
+        if (mins < 60) return `${Math.round(mins)} min`;
+        if (mins < 60 * 24) return `${(mins / 60).toFixed(1)} hrs`;
+        return `${(mins / (60 * 24)).toFixed(1)} days`;
+      };
+
+      const overallAvgFormatted = resolvedForAvgTime.length > 0
+        ? formatDuration(totalMs / resolvedForAvgTime.length)
+        : '—';
+
+      const channelAverages = Object.values(channelData).map(c => ({
+        channel: c.channel,
+        count: c.count,
+        avgResolutionTime: formatDuration(c.totalMs / c.count),
+      }));
+
+      const slowestTickets = [...withDurations]
+        .sort((a, b) => b.durationMs - a.durationMs)
+        .slice(0, 10)
+        .map(t => ({
+          id: t.id,
+          customerName: t.customerName,
+          channel: t.channel,
+          status: t.status,
+          receivedAt: t.receivedAt,
+          resolvedAt: t.resolvedAt,
+          durationMs: t.durationMs,
+          durationFormatted: formatDuration(t.durationMs),
+        }));
+
+      return res.json({
+        metric: 'resolution',
+        count: resolvedForAvgTime.length,
+        avgResolutionTime: overallAvgFormatted,
+        periodDays: days,
+        channelAverages,
+        slowestTickets,
+        calculationExplanation: 'Counted from when the message arrived to when the ticket was resolved.',
+      });
+    }
+
+    if (metric === 'escalation') {
+      const [resolvedThisPeriod, escalatedThisPeriod, escalatedTickets] = await Promise.all([
+        prisma.ticket.count({ where: { userId, status: 'resolved', resolvedAt: { gte: since } } }),
+        prisma.ticket.count({ where: { userId, status: 'escalated', updatedAt: { gte: since } } }),
+        prisma.ticket.findMany({
+          where: { userId, status: 'escalated', updatedAt: { gte: since } },
+          orderBy: { updatedAt: 'desc' },
+          take: 50,
+          select: {
+            id: true,
+            customerName: true,
+            channel: true,
+            status: true,
+            urgency: true,
+            escalationReason: true,
+            receivedAt: true,
+            updatedAt: true,
+          },
+        }),
+      ]);
+
+      const MIN_SAMPLE = 5;
+      const decidedThisPeriod = (Number.isFinite(resolvedThisPeriod) ? resolvedThisPeriod : 0) + escalatedThisPeriod;
+      const escalationRate = decidedThisPeriod >= MIN_SAMPLE
+        ? ((escalatedThisPeriod / decidedThisPeriod) * 100).toFixed(1) + '%'
+        : '—';
+
+      const channelCounts = {};
+      for (const t of escalatedTickets) {
+        const ch = t.channel || 'unknown';
+        channelCounts[ch] = (channelCounts[ch] || 0) + 1;
+      }
+
+      return res.json({
+        metric: 'escalation',
+        escalatedCount: escalatedThisPeriod,
+        totalDecided: decidedThisPeriod,
+        ratioText: `${escalatedThisPeriod} of ${decidedThisPeriod}`,
+        escalationRate,
+        periodDays: days,
+        channelCounts,
+        items: escalatedTickets,
+      });
+    }
+  } catch (err) {
+    console.error('Stats details error:', err);
+    res.status(500).json({ error: 'Failed to fetch metric details.' });
   }
 });
 
@@ -3194,8 +3504,21 @@ app.delete('/api/user/disconnect/instagram', authenticateToken, async (req, res)
   try {
     await prisma.user.update({
       where: { id: req.user.userId },
-      data: { instagramBusinessId: null, instagramUsername: null, instagramConnected: false, instagramEnabled: true }
+      data: {
+        instagramBusinessId: null,
+        instagramUsername: null,
+        instagramConnected: false,
+        instagramEnabled: true,
+        instagramAutoSend: false,
+      }
     });
+    await prisma.autoReplyChange.create({
+      data: {
+        userId: req.user.userId,
+        channel: 'instagramAutoSend',
+        enabled: false,
+      },
+    }).catch(e => console.error('[AutoReplyChange] Failed to record IG disconnect reset:', e.message));
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to disconnect Instagram.' });
@@ -3408,7 +3731,17 @@ async function sendWhatsAppMessage(user, ticket, text, senderName = 'Agent') {
 // Website Live Chat: don't trust any account's AI unsupervised until it's
 // been observed against that account's real knowledge base first.
 async function tryAutoReplyWhatsAppNative(user, ticket, currentMessageText) {
-  if (!user.whatsappAutoSend) return;
+  const freshUser = await prisma.user.findUnique({
+    where: { id: user.id },
+  });
+  if (!freshUser || !freshUser.whatsappAutoSend) return;
+  const isWaConnected = !!(
+    (freshUser.whatsappToken && freshUser.whatsappPhoneNumberId) ||
+    (process.env.WHATSAPP_ACCESS_TOKEN &&
+     process.env.WHATSAPP_PHONE_NUMBER_ID &&
+     process.env.WHATSAPP_OWNER_USER_ID === freshUser.id)
+  );
+  if (!isWaConnected) return;
 
   try {
     // Build history from everything recorded on this ticket BEFORE the
@@ -3425,7 +3758,7 @@ async function tryAutoReplyWhatsAppNative(user, ticket, currentMessageText) {
       .slice(0, -1)
       .map(m => ({ role: m.direction === 'outbound' ? 'assistant' : 'user', content: m.content }));
 
-    const result = await generateNativeDraft(user.id, {
+    const result = await generateNativeDraft(freshUser.id, {
       customerName: ticket.customerName,
       messageText: currentMessageText,
       channel: 'whatsapp',
@@ -3436,7 +3769,7 @@ async function tryAutoReplyWhatsAppNative(user, ticket, currentMessageText) {
     if (result.status === 'escalated') {
       const ackMessage = result.codeForcedEscalation ? ESCALATION_FALLBACK_MESSAGE : result.draft;
       try {
-        await sendWhatsAppMessage(user, ticket, ackMessage, 'AI (escalation ack)');
+        await sendWhatsAppMessage(freshUser, ticket, ackMessage, 'AI (escalation ack)');
       } catch (ackErr) {
         console.error(`[WhatsApp AutoReply] Escalation acknowledgment failed to send for ticket ${ticket.id}:`, ackErr.message);
       }
@@ -3455,7 +3788,7 @@ async function tryAutoReplyWhatsAppNative(user, ticket, currentMessageText) {
     // error) — caught below, same fail-closed behavior as every other
     // auto-reply path: nothing sent, ticket stays as a normal new
     // message for a human to handle.
-    await sendWhatsAppMessage(user, ticket, result.draft, 'AI (auto-reply)');
+    await sendWhatsAppMessage(freshUser, ticket, result.draft, 'AI (auto-reply)');
 
     await prisma.ticket.update({
       where: { id: ticket.id },
@@ -3486,7 +3819,12 @@ async function tryAutoReplyWhatsAppNative(user, ticket, currentMessageText) {
 // don't trust any account's AI unsupervised until it's been observed
 // against that account's real knowledge base first.
 async function tryAutoReplyWebsiteNative(user, session, currentMessageText) {
-  if (!user.livechatAutoSend) return;
+  const freshUser = await prisma.user.findUnique({
+    where: { id: user.id },
+    select: { id: true, livechatAutoSend: true, livechatEnabled: true, livechatToken: true },
+  });
+  if (!freshUser || !freshUser.livechatAutoSend || freshUser.livechatEnabled === false) return;
+  if (!freshUser.livechatToken) return;
 
   try {
     // Same history-building fix as WhatsApp/Instagram — without this,
@@ -3500,7 +3838,7 @@ async function tryAutoReplyWebsiteNative(user, session, currentMessageText) {
       .slice(0, -1)
       .map(m => ({ role: m.role === 'agent' ? 'assistant' : 'user', content: m.content }));
 
-    const result = await generateNativeDraft(user.id, {
+    const result = await generateNativeDraft(freshUser.id, {
       customerName: session.visitorName,
       messageText: currentMessageText,
       channel: 'website',
@@ -3610,8 +3948,19 @@ If has_qualifying_info is false, all other fields must be null.`;
 // actual knowledge base before trusting it unsupervised. Same caution that
 // caught a real hallucination bug on WhatsApp before it caused harm.
 async function tryAutoReplyInstagramNative(user, ticket, currentMessageText) {
-  if (!user.instagramAutoSend) return;
-  if (!user.instagramBusinessId || !user.facebookPageToken) return;
+  const freshUser = await prisma.user.findUnique({
+    where: { id: user.id },
+    select: {
+      id: true,
+      instagramAutoSend: true,
+      instagramEnabled: true,
+      instagramConnected: true,
+      instagramBusinessId: true,
+      facebookPageToken: true,
+    },
+  });
+  if (!freshUser || !freshUser.instagramAutoSend || freshUser.instagramEnabled === false) return;
+  if (!freshUser.instagramConnected || !freshUser.instagramBusinessId || !freshUser.facebookPageToken) return;
 
   try {
     // Same history-building fix as WhatsApp/Website — without this, every
@@ -3624,7 +3973,7 @@ async function tryAutoReplyInstagramNative(user, ticket, currentMessageText) {
       .slice(0, -1)
       .map(m => ({ role: m.direction === 'outbound' ? 'assistant' : 'user', content: m.content }));
 
-    const result = await generateNativeDraft(user.id, {
+    const result = await generateNativeDraft(freshUser.id, {
       customerName: ticket.customerName,
       messageText: currentMessageText,
       channel: 'instagram',
@@ -3636,7 +3985,7 @@ async function tryAutoReplyInstagramNative(user, ticket, currentMessageText) {
       const ackMessage = result.codeForcedEscalation ? ESCALATION_FALLBACK_MESSAGE : result.draft;
       try {
         const ackRes = await fetch(
-          `https://graph.facebook.com/${GRAPH_VERSION}/me/messages?access_token=${user.facebookPageToken}`,
+          `https://graph.facebook.com/${GRAPH_VERSION}/me/messages?access_token=${freshUser.facebookPageToken}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -3663,7 +4012,7 @@ async function tryAutoReplyInstagramNative(user, ticket, currentMessageText) {
     // Uses graph.facebook.com + facebookPageToken — see comment in
     // /api/instagram/reply above for the full explanation.
     const sendRes = await fetch(
-      `https://graph.facebook.com/${GRAPH_VERSION}/me/messages?access_token=${user.facebookPageToken}`,
+      `https://graph.facebook.com/${GRAPH_VERSION}/me/messages?access_token=${freshUser.facebookPageToken}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3724,8 +4073,19 @@ async function tryAutoReplyInstagramNative(user, ticket, currentMessageText) {
 // channel: don't trust any account's AI unsupervised until observed
 // against that account's real knowledge base first.
 async function tryAutoReplyFacebookNative(user, ticket, currentMessageText) {
-  if (!user.facebookAutoSend) return;
-  if (!user.facebookPageId || !user.facebookPageToken) return;
+  const freshUser = await prisma.user.findUnique({
+    where: { id: user.id },
+    select: {
+      id: true,
+      facebookAutoSend: true,
+      facebookEnabled: true,
+      facebookConnected: true,
+      facebookPageId: true,
+      facebookPageToken: true,
+    },
+  });
+  if (!freshUser || !freshUser.facebookAutoSend || freshUser.facebookEnabled === false) return;
+  if (!freshUser.facebookConnected || !freshUser.facebookPageId || !freshUser.facebookPageToken) return;
 
   try {
     const priorMessages = await prisma.message.findMany({
@@ -3736,7 +4096,7 @@ async function tryAutoReplyFacebookNative(user, ticket, currentMessageText) {
       .slice(0, -1)
       .map(m => ({ role: m.direction === 'outbound' ? 'assistant' : 'user', content: m.content }));
 
-    const result = await generateNativeDraft(user.id, {
+    const result = await generateNativeDraft(freshUser.id, {
       customerName: ticket.customerName,
       messageText: currentMessageText,
       channel: 'facebook',
@@ -3745,7 +4105,7 @@ async function tryAutoReplyFacebookNative(user, ticket, currentMessageText) {
     });
 
     const sendToMessenger = async (text) => {
-      return fetch(`https://graph.facebook.com/${GRAPH_VERSION}/me/messages?access_token=${user.facebookPageToken}`, {
+      return fetch(`https://graph.facebook.com/${GRAPH_VERSION}/me/messages?access_token=${freshUser.facebookPageToken}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -4188,8 +4548,20 @@ app.post('/api/whatsapp/disconnect', authenticateToken, async (req, res) => {
   try {
     await prisma.user.update({
       where: { id: req.user.userId },
-      data: { whatsappToken: null, whatsappPhoneNumberId: null, whatsappWabaId: null },
+      data: {
+        whatsappToken: null,
+        whatsappPhoneNumberId: null,
+        whatsappWabaId: null,
+        whatsappAutoSend: false,
+      },
     });
+    await prisma.autoReplyChange.create({
+      data: {
+        userId: req.user.userId,
+        channel: 'whatsappAutoSend',
+        enabled: false,
+      },
+    }).catch(e => console.error('[AutoReplyChange] Failed to record WhatsApp disconnect reset:', e.message));
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to disconnect WhatsApp.' });
@@ -4461,4 +4833,11 @@ if (process.env.NODE_ENV !== 'test') {
 }
 
 export default app;
-export { isValidMetaSignature, isValidPaddleSignature };
+export {
+  isValidMetaSignature,
+  isValidPaddleSignature,
+  tryAutoReplyFacebookNative,
+  tryAutoReplyWhatsAppNative,
+  tryAutoReplyInstagramNative,
+  tryAutoReplyWebsiteNative,
+};
